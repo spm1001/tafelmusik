@@ -22,15 +22,15 @@ For deep understanding of how the CRDT actually works — update encoding, state
 
 ## MCP server connection lifecycle
 
-The MCP server's connection lifecycle has a specific pattern: httpx client at the top (created in lifespan, shared across rooms), per-room WebSocket connections created lazily on first tool call, and pycrdt Provider tasks syncing each room's Doc. The Y.Text key is "content" everywhere — browser, MCP server, tests — consistency here is load-bearing for sync.
+The MCP server's connection lifecycle has a specific pattern: httpx client at the top (created in lifespan, shared across rooms), per-room WebSocket connections created lazily on first tool call, and a standalone sync loop syncing each room's Doc. The Y.Text key is "content" everywhere — browser, MCP server, tests — consistency here is load-bearing for sync.
 
-Each room connection lives inside a `_provider_task()` closure that wraps both `aconnect_ws` (the WebSocket) and `provider.start()` in a single asyncio Task. This isn't arbitrary indirection — it's required by anyio's cancel scope model. `aconnect_ws` pushes cancel scopes that are bound to the asyncio Task that entered them. If you open the WebSocket in one task (e.g., the tool handler) and run the Provider in another (e.g., via `asyncio.create_task()`), the Provider's interactions with the WebSocket trigger cross-task cancel scope violations: `RuntimeError: Attempted to exit cancel scope in a different task`. Reads appear to work (no cancel scope interaction) but writes crash the MCP server, because the Provider's `_send_updates` task sends CRDT updates through the WebSocket. The `_provider_task()` pattern keeps everything in one task. If you're tempted to "simplify" by pulling `aconnect_ws` out of the closure, don't — the bisection test (bare write → write+observer → write+Provider) is how we found this.
+Each room connection lives inside a `_sync_task()` closure that wraps both `aconnect_ws` (the WebSocket) and `_sync_loop()` in a single asyncio Task. This isn't arbitrary indirection — it's required by anyio's cancel scope model. `aconnect_ws` pushes cancel scopes that are bound to the asyncio Task that entered them. If you open the WebSocket in one task and run the sync loop in another, WebSocket interactions trigger cross-task cancel scope violations: `RuntimeError: Attempted to exit cancel scope in a different task`. The `_sync_task()` pattern keeps everything in one task.
 
-The base Provider has a subtle liveness bug: when the server disconnects, `_run()` exits (channel iterator stops) but `_send_updates()` stays alive forever waiting for local Doc events. The task group never finishes, so the provider task never completes, and the `dead` event never fires. SyncAwareProvider fixes both this (cancels the task group when `_run()` exits) and the sync detection problem (intercepts SYNC_STEP2, the message that delivers the server's full state, and exposes a deterministic `synced` event — no sleep heuristic needed).
+The sync protocol is implemented in ~40 lines using only public pycrdt APIs: `create_sync_message` (initiates handshake), `handle_sync_message` (processes incoming sync messages), `create_update_message` (broadcasts local changes), and `doc.events()` (async iterator for local mutations). An anyio `create_task_group` runs the receive loop, `_send_updates`, and optionally `_heartbeat` concurrently, with the task group cancelled when the channel iterator ends (connection lost). Sync detection is built in: the `synced` event fires when SYNC_STEP2 is received (the server's full state), and the `dead` event fires when the sync task exits for any reason.
 
-## pycrdt private API coupling
+The channel abstraction (`Channel` Protocol + `WebSocketChannel` adapter) decouples the sync protocol from httpx-ws specifics. `WebSocketChannel` is a ~15-line wrapper around `send_bytes`/`receive_bytes` with a send lock. `MockChannel` in `conftest.py` implements the same Protocol for unit testing — it auto-responds to SYNC_STEP1 with SYNC_STEP2 when given a peer Doc, enabling deterministic sync testing without a real server.
 
-SyncAwareProvider overrides `Provider._run()` and calls `Provider._send_updates()`. It also accesses `_doc`, `_channel`, and `_task_group`. Provider's public API is just `start()` and `stop()` — everything else is private. This is validated against pycrdt 0.12.50 with a runtime import-time assertion that checks the private methods exist. If upgrading pycrdt, run the full test suite — a changed `_run()` signature or `_send_updates()` removal would break sync silently. There's no clean alternative: Provider doesn't expose extension points for custom sync detection or channel-level message interception.
+A keepalive mechanism detects silently dead connections: after `keepalive` seconds of silence, `_heartbeat` sends a SYNC_STEP1 probe (protocol-correct — the server responds with SYNC_STEP2). If no response arrives within `min(keepalive, 10)` more seconds, the task group is cancelled and the connection is marked dead. Disabled (keepalive=None) in tests to avoid timing sensitivity.
 
 ## Working with niche libraries
 
@@ -39,6 +39,12 @@ pycrdt-websocket is a framework where the persistence docs lag the capabilities.
 ## Async testing landmines
 
 The anyio/asyncio boundary is real: aconnect_ws (httpx-ws) uses anyio cancel scopes that are bound to the asyncio Task that entered them. This means test fixtures (which may teardown in a different task) can't manage WebSocket lifetimes — use @asynccontextmanager helpers instead. This is a Python 3.14 + anyio interaction, not a pycrdt-specific issue.
+
+The `connect_peer()` test helper in `conftest.py` handles this correctly: it wraps `aconnect_ws` + `_sync_loop` in a single `asyncio.create_task`, waits for deterministic `synced` event (SYNC_STEP2 detection) instead of sleeping, and yields a `Text` object for the test to use. All test files should use `connect_peer()` instead of raw `Provider` + sleep for simulating browser clients.
+
+## Debugging across library boundaries
+
+When N libraries interact and something breaks, bisect the layers before theorising. The approach that cracked the cancel scope bug: bare pycrdt write (works) → write with observer (works) → write with background `asyncio.create_task` (works) → write with Provider (crashes). Each step adds one layer; the failing step isolates the interaction. This took 5 minutes after 20 minutes of theorising about anyio task groups and event types found nothing. The lesson generalises: test each pair of libraries in isolation before reasoning about the whole stack.
 
 ## Document operations
 

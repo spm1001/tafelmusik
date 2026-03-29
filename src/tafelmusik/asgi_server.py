@@ -107,10 +107,14 @@ def create_app(
     """Create the ASGI application with the given configuration."""
 
     _db_path = str(db_path)
-    Store = type("Store", (SQLiteYStore,), {
-        "db_path": _db_path,
-        "squash_after_inactivity_of": 60,  # compact updates after 60s of no edits
-    })
+    Store = type(
+        "Store",
+        (SQLiteYStore,),
+        {
+            "db_path": _db_path,
+            "squash_after_inactivity_of": 60,  # compact updates after 60s of no edits
+        },
+    )
 
     ws_server = TafelmusikWebsocketServer(store_cls=Store)
 

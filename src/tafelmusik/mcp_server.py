@@ -1,17 +1,17 @@
 """MCP server entry point — ephemeral, connects to ASGI server as Yjs peer.
 
 Architecture: FastMCP with stdio transport. Maintains persistent WebSocket
-connections to the ASGI server — one per room. Each connection runs a pycrdt
-Provider that syncs a local Doc with the server's Y.Doc. Tools operate on the
-local Doc; the Provider handles bidirectional sync automatically.
+connections to the ASGI server — one per room. Each connection runs a
+standalone Yjs sync loop that syncs a local Doc with the server's Y.Doc.
+Tools operate on the local Doc; the sync loop handles bidirectional sync.
 
 Lifecycle: httpx client created at startup (lifespan), room connections
 created lazily on first tool call, all cleaned up when the MCP process exits.
 
 Important: aconnect_ws (httpx-ws) uses anyio cancel scopes that are bound to
-the asyncio Task that entered them. The Provider must run in the SAME task
-that opens the WebSocket. This is why _provider_task() wraps both aconnect_ws
-and provider.start() — separating them across tasks causes cancel scope errors.
+the asyncio Task that entered them. The sync loop must run in the SAME task
+that opens the WebSocket. This is why _sync_task() wraps both aconnect_ws
+and _sync_loop() — separating them across tasks causes cancel scope errors.
 """
 
 from __future__ import annotations
@@ -19,23 +19,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import httpx
-from anyio import Event
+from anyio import Event, create_task_group, sleep
 from httpx_ws import aconnect_ws
 from mcp.server.fastmcp import Context, FastMCP
-from pycrdt import Doc, Text
 from pycrdt import (
+    Doc,
+    Text,
     YMessageType,
     YSyncMessageType,
     create_sync_message,
+    create_update_message,
     handle_sync_message,
 )
-from pycrdt.websocket.websocket import HttpxWebsocket
-from pycrdt.websocket.yroom import Provider
 
 from tafelmusik import document
 
@@ -47,53 +49,116 @@ def _ws_to_http(url: str) -> str:
     return url.replace("ws://", "http://").replace("wss://", "https://")
 
 
-# --- Sync-aware Provider ---
-#
-# SyncAwareProvider overrides Provider._run() and calls Provider._send_updates().
-# Both are private APIs — Provider's public surface is just start() and stop().
-# We also access _doc, _channel, and _task_group (set by Provider.__init__).
-# Validated against pycrdt 0.12.50. If upgrading pycrdt, re-run tests.
-
-_PROVIDER_PRIVATE_ATTRS = ("_doc", "_channel", "_task_group", "_send_updates", "_run")
-for _attr in _PROVIDER_PRIVATE_ATTRS:
-    if not hasattr(Provider, _attr) and _attr in ("_send_updates", "_run"):
-        raise ImportError(
-            f"Provider.{_attr} not found — pycrdt API may have changed. "
-            f"SyncAwareProvider was validated against pycrdt 0.12.50."
-        )
+# --- Channel abstraction ---
 
 
-class SyncAwareProvider(Provider):
-    """Provider subclass that exposes a deterministic 'synced' event.
+class Channel(Protocol):
+    """Bidirectional message channel for the Yjs sync protocol."""
 
-    The base Provider's `started` event fires before SYNC_STEP1 is even sent.
-    This subclass intercepts the SYNC_STEP2 response — the message that delivers
-    the server's full state — and sets `synced` immediately after applying it.
+    async def send(self, message: bytes) -> None: ...
+    def __aiter__(self) -> Channel: ...
+    async def __anext__(self) -> bytes: ...
+
+
+class WebSocketChannel:
+    """Wraps an httpx-ws session as a Yjs sync channel."""
+
+    def __init__(self, websocket) -> None:
+        self._ws = websocket
+
+    async def send(self, message: bytes) -> None:
+        # httpx-ws already serialises writes via its internal _write_lock
+        await self._ws.send_bytes(message)
+
+    def __aiter__(self) -> WebSocketChannel:
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return bytes(await self._ws.receive_bytes())
+        except Exception:
+            raise StopAsyncIteration()
+
+
+# --- Standalone Yjs sync protocol ---
+
+
+async def _send_updates(doc: Doc, channel: Channel) -> None:
+    """Broadcast local Doc changes to the peer as SYNC_UPDATE messages."""
+    async with doc.events() as events:
+        async for event in events:
+            await channel.send(create_update_message(event.update))
+
+
+async def _sync_loop(
+    doc: Doc,
+    channel: Channel,
+    synced: Event,
+    *,
+    keepalive: float | None = 60.0,
+) -> None:
+    """Run the Yjs sync protocol over a channel.
+
+    Sends SYNC_STEP1, handles incoming sync messages, and broadcasts local
+    changes. Sets ``synced`` when SYNC_STEP2 is received (server's full state
+    has been applied). Returns when the channel closes or keepalive times out.
+
+    Args:
+        keepalive: Seconds of silence before sending a sync probe. If the
+            probe gets no response within ``min(keepalive, 10)`` more seconds,
+            the connection is presumed dead and the loop exits. ``None``
+            disables keepalive (used in tests).
     """
+    await channel.send(create_sync_message(doc))
+    last_recv = time.monotonic()
+    # Capture as non-optional float so _heartbeat's type is clean.
+    # Guarded by `if keepalive is not None` before start_soon(_heartbeat).
+    interval = keepalive or 0.0
 
-    def __init__(self, *args, synced: Event | None = None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.synced = synced or Event()
+    async def _heartbeat() -> None:
+        while True:
+            await sleep(interval)
+            if time.monotonic() - last_recv < interval:
+                continue
+            # No messages received — send a sync probe
+            try:
+                await channel.send(create_sync_message(doc))
+            except Exception:
+                tg.cancel_scope.cancel()
+                return
+            # Wait for a response
+            await sleep(min(interval, 10.0))
+            if time.monotonic() - last_recv >= interval:
+                log.warning(
+                    "No messages in %.0fs (keepalive probe unanswered), connection presumed dead",
+                    time.monotonic() - last_recv,
+                )
+                tg.cancel_scope.cancel()
+                return
 
-    async def _run(self):
-        sync_message = create_sync_message(self._doc)
-        await self._channel.send(sync_message)
-        assert self._task_group is not None
-        self._task_group.start_soon(self._send_updates)
-        async for message in self._channel:
+    # _send_updates and _heartbeat run as anyio task group subtasks (separate
+    # asyncio Tasks).  This is safe because they only do I/O (send_bytes) on
+    # the WebSocket — they don't enter/exit cancel scopes.  The constraint
+    # "same asyncio Task" applies to cancel scope lifecycle (aconnect_ws
+    # __aenter__/__aexit__), not to I/O within an existing scope.  Structured
+    # concurrency guarantees subtasks are cancelled before the parent's scope
+    # exits, so no subtask can touch the WebSocket after aconnect_ws closes.
+    async with create_task_group() as tg:
+        tg.start_soon(_send_updates, doc, channel)
+        if keepalive is not None:
+            tg.start_soon(_heartbeat)
+        async for message in channel:
+            last_recv = time.monotonic()
             if message[0] == YMessageType.SYNC:
                 msg_type = YSyncMessageType(message[1])
-                reply = handle_sync_message(message[1:], self._doc)
+                reply = handle_sync_message(message[1:], doc)
                 if reply is not None:
-                    await self._channel.send(reply)
-                if msg_type == YSyncMessageType.SYNC_STEP2 and not self.synced.is_set():
-                    self.synced.set()
-        # Channel iterator ended — connection lost. Cancel the task group
-        # so _send_updates stops and the provider task completes. Without
-        # this, _send_updates hangs forever waiting for local events,
-        # provider.start() never returns, and the dead event never fires.
-        if self._task_group is not None:
-            self._task_group.cancel_scope.cancel()
+                    await channel.send(reply)
+                if msg_type == YSyncMessageType.SYNC_STEP2 and not synced.is_set():
+                    synced.set()
+        # Channel iterator ended — connection lost. Cancel _send_updates
+        # so this function returns and the caller can set the dead event.
+        tg.cancel_scope.cancel()
 
 
 # --- Connection management ---
@@ -104,7 +169,7 @@ class RoomConnection:
     """A live connection to a single room on the ASGI server.
 
     Holds the local Doc (with a Y.Text keyed "content") and events for
-    sync status and liveness. The Provider runs in a background task that
+    sync status and liveness. The sync loop runs in a background task that
     also owns the WebSocket — they share the same asyncio Task to avoid
     anyio cancel scope cross-task violations.
     """
@@ -137,6 +202,7 @@ class AppState:
     server_url: str
     rooms: dict[str, RoomConnection] = field(default_factory=dict)
     sync_timeout: float = 10.0
+    keepalive: float | None = 60.0
 
     async def connect(self, room: str) -> RoomConnection:
         """Get or create a connection to a room.
@@ -161,24 +227,23 @@ class AppState:
         synced = Event()
         dead = Event()
 
-        async def _provider_task():
-            """Run WebSocket + Provider in the same asyncio Task.
+        async def _sync_task():
+            """Run WebSocket + sync protocol in the same asyncio Task.
 
             aconnect_ws cancel scopes are task-bound — entering the WebSocket
-            in one task and running the Provider in another causes RuntimeError.
+            in one task and running the sync loop in another causes RuntimeError.
             This function keeps both in the same task.
             """
             try:
                 async with aconnect_ws(f"{http_url}/{room}", self.client) as ws:
-                    channel = HttpxWebsocket(ws, room)
-                    provider = SyncAwareProvider(doc, channel, synced=synced)
-                    await provider.start()
+                    channel = WebSocketChannel(ws)
+                    await _sync_loop(doc, channel, synced, keepalive=self.keepalive)
             except Exception:
-                log.warning("Provider task for room %s failed", room, exc_info=True)
+                log.warning("Sync task for room %s failed", room, exc_info=True)
             finally:
                 dead.set()
 
-        task = asyncio.create_task(_provider_task())
+        task = asyncio.create_task(_sync_task())
 
         # Race synced against dead — if the connection fails before sync
         # completes, dead fires first and we fail fast instead of waiting
@@ -215,7 +280,11 @@ class AppState:
             )
 
         conn = RoomConnection(
-            doc=doc, text=text, synced=synced, dead=dead, _task=task,
+            doc=doc,
+            text=text,
+            synced=synced,
+            dead=dead,
+            _task=task,
         )
         self.rooms[room] = conn
         return conn

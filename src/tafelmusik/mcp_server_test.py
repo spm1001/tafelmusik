@@ -1,7 +1,7 @@
 """Tests for MCP server — integration tests against a real ASGI server.
 
 Tests the AppState/RoomConnection connection management and tool logic
-by connecting to a live server instance.
+by connecting to a live server instance.  Also unit tests for _sync_loop.
 """
 
 import asyncio
@@ -10,14 +10,12 @@ from contextlib import asynccontextmanager
 import httpx
 import pytest
 import uvicorn
-from httpx_ws import aconnect_ws
-from pycrdt import Doc, Text
-from pycrdt.websocket.websocket import HttpxWebsocket
-from pycrdt.websocket.yroom import Provider
+from anyio import Event
+from pycrdt import Doc, Text, YMessageType, YSyncMessageType
 
 from tafelmusik.asgi_server import create_app
-from tafelmusik.conftest import get_free_port
-from tafelmusik.mcp_server import AppState
+from tafelmusik.conftest import MockChannel, connect_peer, get_free_port
+from tafelmusik.mcp_server import AppState, _sync_loop
 
 
 @pytest.fixture
@@ -38,7 +36,7 @@ async def server(tmp_path):
 
 
 @asynccontextmanager
-async def make_state(port):
+async def make_state(port, **kwargs):
     """Create an AppState with setup and teardown in the same task.
 
     Using a context manager (not a fixture) ensures that the anyio cancel
@@ -46,11 +44,154 @@ async def make_state(port):
     Task. Pytest-asyncio fixture teardown can run in a different task context.
     """
     async with httpx.AsyncClient() as client:
-        state = AppState(client=client, server_url=f"ws://127.0.0.1:{port}")
+        state = AppState(
+            client=client,
+            server_url=f"ws://127.0.0.1:{port}",
+            keepalive=None,  # No keepalive in tests
+            **kwargs,
+        )
         try:
             yield state
         finally:
             await state.close_all()
+
+
+# --- Unit tests for _sync_loop ---
+
+
+async def test_sync_loop_handshake():
+    """_sync_loop sends SYNC_STEP1 and sets synced on SYNC_STEP2."""
+    server_doc = Doc()
+    server_doc["content"] = server_text = Text()
+    server_text += "Server content"
+
+    client_doc = Doc()
+    client_doc["content"] = client_text = Text()
+
+    synced = Event()
+    channel = MockChannel(peer_doc=server_doc)
+
+    task = asyncio.create_task(_sync_loop(client_doc, channel, synced, keepalive=None))
+    await asyncio.wait_for(synced.wait(), timeout=2.0)
+
+    assert synced.is_set()
+    assert "Server content" in str(client_text)
+    # First message sent should be SYNC (type byte 0)
+    assert channel.sent[0][0] == YMessageType.SYNC
+
+    channel.close()
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_sync_loop_broadcasts_local_changes():
+    """Local doc changes are sent as SYNC_UPDATE messages."""
+    server_doc = Doc()
+    server_doc["content"] = Text()
+
+    client_doc = Doc()
+    client_doc["content"] = client_text = Text()
+
+    synced = Event()
+    channel = MockChannel(peer_doc=server_doc)
+
+    task = asyncio.create_task(_sync_loop(client_doc, channel, synced, keepalive=None))
+    await asyncio.wait_for(synced.wait(), timeout=2.0)
+
+    initial_sent = len(channel.sent)
+    client_text += "New local content"
+    await asyncio.sleep(0.1)  # Let _send_updates pick it up
+
+    assert len(channel.sent) > initial_sent
+    update_msg = channel.sent[-1]
+    assert update_msg[0] == YMessageType.SYNC
+    assert YSyncMessageType(update_msg[1]) == YSyncMessageType.SYNC_UPDATE
+
+    channel.close()
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_sync_loop_exits_on_channel_close():
+    """_sync_loop returns when the channel iterator ends."""
+    doc = Doc()
+    doc["content"] = Text()
+
+    synced = Event()
+    channel = MockChannel(peer_doc=Doc())
+
+    task = asyncio.create_task(_sync_loop(doc, channel, synced, keepalive=None))
+    await asyncio.wait_for(synced.wait(), timeout=2.0)
+
+    channel.close()
+    await asyncio.wait_for(task, timeout=2.0)
+    assert task.done()
+
+
+async def test_sync_loop_keepalive_detects_dead():
+    """Keepalive probe detects unresponsive connection."""
+    server_doc = Doc()
+    server_doc["content"] = Text()
+
+    class SilentAfterSync(MockChannel):
+        """Responds to initial sync, then ignores everything."""
+
+        def __init__(self, peer_doc):
+            super().__init__(peer_doc)
+            self._synced = False
+
+        async def send(self, message: bytes) -> None:
+            self.sent.append(message)
+            if not self._synced and self._peer_doc is not None:
+                if message[0] == YMessageType.SYNC:
+                    from pycrdt import handle_sync_message
+
+                    reply = handle_sync_message(message[1:], self._peer_doc)
+                    if reply is not None:
+                        self._queue.put_nowait(reply)
+                        self._synced = True
+
+    doc = Doc()
+    doc["content"] = Text()
+    synced = Event()
+    channel = SilentAfterSync(peer_doc=server_doc)
+
+    # keepalive=0.3 → probe at 0.3s, wait 0.3s for response → dead at ~0.6s
+    task = asyncio.create_task(_sync_loop(doc, channel, synced, keepalive=0.3))
+    await asyncio.wait_for(synced.wait(), timeout=2.0)
+
+    # Task should exit on its own when keepalive detects the dead connection
+    await asyncio.wait_for(task, timeout=3.0)
+    assert task.done()
+
+    # Should have sent at least one keepalive probe (a second SYNC_STEP1)
+    sync_step1_count = sum(
+        1
+        for msg in channel.sent
+        if msg[0] == YMessageType.SYNC and YSyncMessageType(msg[1]) == YSyncMessageType.SYNC_STEP1
+    )
+    assert sync_step1_count >= 2, "Expected initial SYNC_STEP1 + at least one probe"
+
+
+async def test_subtask_sends_reach_server(server):
+    """Verify that _send_updates (anyio subtask) can send on the parent's WebSocket.
+
+    _sync_loop uses create_task_group: the receive loop runs in the host task
+    (same asyncio Task as aconnect_ws), while _send_updates runs in a subtask
+    (separate asyncio Task).  This test proves that writes from the subtask
+    actually reach the server and are visible to another client — i.e., the
+    anyio structured concurrency contract lets subtasks do I/O on the parent's
+    WebSocket without cancel scope violations.
+    """
+    async with make_state(server) as state:
+        conn = await state.connect("subtask-send-test")
+        conn.text += "Written via _send_updates subtask"
+        await asyncio.sleep(0.5)
+
+    # Second client reads — if the subtask send failed, this would be empty
+    async with connect_peer(server, "subtask-send-test") as text:
+        assert "Written via _send_updates subtask" in str(text)
+
+
+# --- Integration tests ---
 
 
 async def test_connect_and_read_empty(server):
@@ -72,41 +213,20 @@ async def test_write_then_read(server):
 async def test_mcp_write_visible_to_browser_client(server):
     """Content written via MCP appears in a separate pycrdt client (simulates browser)."""
     async with make_state(server) as state:
-        # Write via MCP
         conn = await state.connect("test-mcp-to-browser")
         conn.text += "# From Claude\n\nThis was written by the MCP server.\n"
         await asyncio.sleep(0.5)
 
-        # Read via separate pycrdt client (simulates browser)
-        doc = Doc()
-        doc["content"] = text = Text()
-        async with httpx.AsyncClient() as client:
-            async with aconnect_ws(f"http://127.0.0.1:{server}/test-mcp-to-browser", client) as ws:
-                channel = HttpxWebsocket(ws, "test-mcp-to-browser")
-                provider = Provider(doc, channel)
-                asyncio.create_task(provider.start())
-                await asyncio.sleep(0.5)
-
-                assert "From Claude" in str(text)
-                assert "written by the MCP server" in str(text)
-                await provider.stop()
+        async with connect_peer(server, "test-mcp-to-browser") as text:
+            assert "From Claude" in str(text)
+            assert "written by the MCP server" in str(text)
 
 
 async def test_browser_write_visible_to_mcp(server):
     """Content written by a separate pycrdt client is readable via MCP."""
-    # Write via separate client (simulates browser)
-    doc = Doc()
-    doc["content"] = text = Text()
-    async with httpx.AsyncClient() as client:
-        async with aconnect_ws(f"http://127.0.0.1:{server}/test-browser-to-mcp", client) as ws:
-            channel = HttpxWebsocket(ws, "test-browser-to-mcp")
-            provider = Provider(doc, channel)
-            asyncio.create_task(provider.start())
-            await asyncio.sleep(0.5)
-
-            text += "# From Browser\n\nSameer typed this.\n"
-            await asyncio.sleep(0.5)
-            await provider.stop()
+    async with connect_peer(server, "test-browser-to-mcp") as text:
+        text += "# From Browser\n\nSameer typed this.\n"
+        await asyncio.sleep(0.5)
 
     # Read via MCP
     async with make_state(server) as state:
@@ -157,24 +277,15 @@ async def test_reconnect_same_room(server):
 
 async def test_list_rooms_endpoint(server):
     """The /api/rooms endpoint returns room names."""
-    doc = Doc()
-    doc["content"] = text = Text()
-    async with httpx.AsyncClient() as client:
-        async with aconnect_ws(f"http://127.0.0.1:{server}/listed-room", client) as ws:
-            channel = HttpxWebsocket(ws, "listed-room")
-            provider = Provider(doc, channel)
-            asyncio.create_task(provider.start())
-            await asyncio.sleep(0.5)
+    async with connect_peer(server, "listed-room") as text:
+        text += "Some content"
+        await asyncio.sleep(0.5)
 
-            text += "Some content"
-            await asyncio.sleep(0.5)
-
+        async with httpx.AsyncClient() as client:
             response = await client.get(f"http://127.0.0.1:{server}/api/rooms")
             assert response.status_code == 200
             data = response.json()
             assert "listed-room" in data["rooms"]
-
-            await provider.stop()
 
 
 async def test_sync_timeout(tmp_path):
@@ -205,6 +316,7 @@ async def test_sync_timeout(tmp_path):
                 client=client,
                 server_url=f"ws://127.0.0.1:{port}",
                 sync_timeout=1.0,
+                keepalive=None,
             )
             with pytest.raises(TimeoutError, match="timed out"):
                 await state.connect("test-room")
@@ -225,6 +337,7 @@ async def test_connect_fails_fast_when_server_down():
             client=client,
             server_url="ws://127.0.0.1:1",  # nothing listening
             sync_timeout=10.0,  # should NOT wait this long
+            keepalive=None,
         )
         start = time.monotonic()
         with pytest.raises(ConnectionError, match="Connection to room"):
@@ -248,7 +361,11 @@ async def test_reconnect_after_server_restart(tmp_path):
     await asyncio.sleep(1)
 
     async with httpx.AsyncClient() as client:
-        state = AppState(client=client, server_url=f"ws://127.0.0.1:{port}")
+        state = AppState(
+            client=client,
+            server_url=f"ws://127.0.0.1:{port}",
+            keepalive=None,
+        )
 
         conn1 = await state.connect("reconnect-test")
         conn1.text += "# Before Restart\n\nOriginal content.\n"
