@@ -7,7 +7,7 @@ Collaborative editing layer — Yjs Y.Text + CodeMirror 6 + pycrdt. Both Sameer 
 Three processes, one codebase:
 
 1. **ASGI server** (`asgi_server.py`) — always-running (systemd). Holds Y.Doc, serves web editor, handles WebSocket sync.
-2. **MCP server** (`mcp_server.py`) — ephemeral (spawned by CC). Connects to ASGI server via WebSocket as pycrdt client. Provides tools: `read_doc`, `edit_doc`, `load_doc`, `add_comment`, `list_comments`, `export_to_docs`.
+2. **MCP server** (`mcp_server.py`) — ephemeral (spawned by CC). Connects to ASGI server via WebSocket as pycrdt client. Provides tools: `read_doc`, `edit_doc`, `load_doc`, `list_docs` (+ future: `add_comment`, `list_comments`, `export_to_docs`).
 3. **Channel server** (`channel_server.py`) — ephemeral (spawned by CC). Observes Y.Text changes, pushes notifications.
 
 ## Module Layout
@@ -57,3 +57,8 @@ cd public && npx esbuild cm-entry.js --bundle --outfile=editor.js --minify  # Re
 - `StickyIndex.new(text, idx, Assoc.AFTER)` — constructor `StickyIndex(text, idx)` doesn't work.
 - `observe()` callbacks are synchronous — use `asyncio.Queue.put_nowait()` + async consumer.
 - Python MCP SDK: custom notifications require low-level `Server` API, not FastMCP.
+- `Provider.started` event fires BEFORE sync completes — it only means the task group started. Use `SyncAwareProvider` (in `mcp_server.py`) which intercepts SYNC_STEP2 and exposes a deterministic `synced` event.
+- Base `Provider._run()` exits on disconnect but `_send_updates()` stays alive, so the provider task never completes. `SyncAwareProvider` cancels the task group scope when `_run()` exits, enabling dead connection detection via `_task.done()`.
+- `aconnect_ws` uses anyio cancel scopes that are task-bound. Don't manage `aconnect_ws` in a pytest fixture — use `@asynccontextmanager` helpers so `__aenter__`/`__aexit__` run in the same asyncio Task.
+- `text[start:end] = new_content` does delete+insert in a single Y.Text transaction. Prefer over separate `del` + `insert` calls.
+- `text.clear()` removes all content (equivalent to `del text[:]`).

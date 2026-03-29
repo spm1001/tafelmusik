@@ -11,16 +11,17 @@ from pycrdt.websocket.websocket import HttpxWebsocket
 from pycrdt.websocket.yroom import Provider
 
 from tafelmusik.asgi_server import create_app
+from tafelmusik.conftest import get_free_port
 
 
 @pytest.fixture
 async def server(tmp_path):
-    """Start a tafelmusik server with a temp DB on an ephemeral port."""
+    """Start a tafelmusik server with a temp DB on a free port."""
     app = create_app(db_path=tmp_path / "test.db", public_dir=tmp_path)
     # Write a minimal index.html so static files mount works
     (tmp_path / "index.html").write_text("<html></html>")
 
-    port = 13470
+    port = get_free_port()
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
     srv = uvicorn.Server(config)
     task = asyncio.create_task(srv.serve())
@@ -122,7 +123,7 @@ async def test_persistence_across_restart(tmp_path):
     """Content written to one server instance is restored by a fresh instance."""
     db_path = tmp_path / "persist.db"
     (tmp_path / "index.html").write_text("<html></html>")
-    port = 13471
+    port = get_free_port()
 
     # Server 1: write content
     app1 = create_app(db_path=db_path, public_dir=tmp_path)

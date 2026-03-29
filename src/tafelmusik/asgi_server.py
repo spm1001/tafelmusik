@@ -1,5 +1,7 @@
 """ASGI server entry point — always-running, holds Y.Doc, serves web editor."""
 
+import asyncio
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,7 +11,8 @@ from pycrdt.store.base import YDocNotFound
 from pycrdt.websocket import WebsocketServer
 from pycrdt.websocket.yroom import YRoom
 from starlette.applications import Starlette
-from starlette.routing import Mount, WebSocketRoute
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -107,6 +110,23 @@ def create_app(
         channel = StarletteWebsocket(websocket, room)
         await ws_server.serve(channel)
 
+    def _query_persisted_rooms() -> set[str]:
+        """Query SQLite for room names (runs in a thread to avoid blocking)."""
+        try:
+            conn = sqlite3.connect(_db_path)
+            rooms = {row[0] for row in conn.execute("SELECT DISTINCT path FROM yupdates")}
+            conn.close()
+            return rooms
+        except Exception:
+            return set()  # DB may not exist yet
+
+    async def list_rooms(request):
+        """Return room names from both in-memory rooms and SQLite store."""
+        memory_rooms = set(ws_server.rooms.keys())
+        persisted_rooms = await asyncio.to_thread(_query_persisted_rooms)
+        all_rooms = sorted(memory_rooms | persisted_rooms)
+        return JSONResponse({"rooms": all_rooms})
+
     @asynccontextmanager
     async def lifespan(app):
         async with ws_server:
@@ -115,6 +135,7 @@ def create_app(
     return Starlette(
         lifespan=lifespan,
         routes=[
+            Route("/api/rooms", list_rooms),
             WebSocketRoute("/{room:path}", websocket_endpoint),
             Mount("/", StaticFiles(directory=str(public_dir), html=True)),
         ],

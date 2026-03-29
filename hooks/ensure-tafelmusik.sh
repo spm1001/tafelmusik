@@ -37,7 +37,7 @@ fi
 if systemctl --user is-enabled tafelmusik.service &>/dev/null; then
     systemctl --user restart tafelmusik.service
 else
-    echo "systemd unit not installed — start manually: cd $PLUGIN_ROOT && uv run python -m tafelmusik.asgi_server"
+    echo "systemd unit not installed — start manually: cd $PLUGIN_ROOT && uv run uvicorn tafelmusik.asgi_server:app --host 0.0.0.0 --port $PORT"
     exit 1
 fi
 
