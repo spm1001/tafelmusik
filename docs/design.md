@@ -71,7 +71,7 @@ Claude Code has a research preview feature (`--dangerously-load-development-chan
 
 4. **Editors are pluggable.** The web editor is one client. Future clients connect via the same Yjs protocol (browser WebSocket) or via a file↔Y.Text bridge (Sublime, iA Writer). Adding a new editor doesn't change the collaboration infrastructure.
 
-5. **Comments are first-class data.** Stored in a Y.Map alongside Y.Text, anchored via StickyIndex (position-tracked anchors that survive concurrent edits). Not inline HTML comments, not a sidecar file. Both Claude and Sameer read/write the same comment data structure.
+5. **Comments are first-class data.** Stored in a Y.Map alongside Y.Text, using point+quote anchoring: a single StickyIndex marks the comment's location, a stored quote string identifies the referenced text. This is more resilient than start/end ranges because `replace_section` (Claude's primary editing mode) destroys StickyIndex anchors by deleting their containing text — with point+quote, re-anchoring is a text search for the quote in the new content. Not inline HTML comments, not a sidecar file. Both Claude and Sameer read/write the same comment data structure.
 
 6. **Export is explicit.** Google Docs is a delivery format, not a collaboration surface. Claude reads Y.Text (already markdown), writes a mise deposit, calls mise. The editing happens in Tafelmusik; the sharing happens in Docs.
 

@@ -454,7 +454,7 @@ This means Claude never encounters "connection refused" from MCP tools without e
 
 4. **edit_doc needs section-level addressing, not character offsets.** Claude thinks in sections ("replace the Risks section"), not character positions. The `replace_section` mode should find a heading by text match and replace content until the next heading of equal/higher level. Expose this, not raw offsets.
 
-5. **Channel notifications need semantic summaries.** Y.Text observe gives raw deltas (insert 12 chars at offset 847). That's useless to the LLM. The channel server should cache the previous markdown, diff against new, and produce "Sameer added a bullet to 'Risks and Concerns'." This means the channel server needs a markdown-aware differ, not just raw CRDT events.
+5. **Channel notifications need structured diffs, not raw deltas.** Y.Text observe gives raw deltas (insert 12 chars at offset 847). That's useless. The channel server should cache the previous markdown, diff against new, and produce a structured summary: which section changed + the changed lines. NOT natural language prose — Claude reads diffs better than summaries. A heading-aware text diff (parse headings, identify section, show changed lines) is ~50 lines. A prose summariser ("Sameer added a bullet about budget") is 150-250 lines and less useful.
 
 6. **Multi-document from the start.** All MCP tools take a `room` parameter. The ASGI server supports multiple Yjs rooms natively. Don't build a single-document system — retrofitting multi-doc is painful.
 
