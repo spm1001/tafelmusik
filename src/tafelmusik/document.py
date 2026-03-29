@@ -47,10 +47,15 @@ def read(text: Text) -> str:
 
 
 def replace_all(text: Text, content: str, *, author: str) -> None:
-    """Replace all content, tagged with authorship."""
-    del text[:]
-    if content:
-        text.insert(0, content, attrs={"author": author})
+    """Replace all content, tagged with authorship.
+
+    Wrapped in a single transaction with origin=author so the observer
+    can distinguish Claude's edits from remote edits.
+    """
+    with text.doc.transaction(origin=author):
+        del text[:]
+        if content:
+            text.insert(0, content, attrs={"author": author})
 
 
 def replace_section(text: Text, new_content: str, *, author: str) -> bool:
@@ -66,22 +71,68 @@ def replace_section(text: Text, new_content: str, *, author: str) -> bool:
     heading = new_content.split("\n", 1)[0].strip()
     bounds = find_section(content, heading)
 
-    if bounds is None:
-        # Append with appropriate spacing
-        if content and not content.endswith("\n\n"):
-            separator = "\n\n" if not content.endswith("\n") else "\n"
-        elif not content:
-            separator = ""
-        else:
-            separator = ""
-        insert_at = len(str(text))
-        text.insert(insert_at, separator + new_content, attrs={"author": author})
-        return False
+    with text.doc.transaction(origin=author):
+        if bounds is None:
+            # Append with appropriate spacing
+            if content and not content.endswith("\n\n"):
+                separator = "\n\n" if not content.endswith("\n") else "\n"
+            elif not content:
+                separator = ""
+            else:
+                separator = ""
+            insert_at = len(str(text))
+            text.insert(insert_at, separator + new_content, attrs={"author": author})
+            return False
 
-    start, end = bounds
-    del text[start:end]
-    text.insert(start, new_content, attrs={"author": author})
-    return True
+        start, end = bounds
+        del text[start:end]
+        text.insert(start, new_content, attrs={"author": author})
+        return True
+
+
+def diff_sections(old: str, new: str) -> list[tuple[str, str]]:
+    """Compare two markdown strings and return which sections changed.
+
+    Returns a list of (heading, change_type) tuples where change_type is
+    one of "added", "removed", or "modified".
+    """
+    old_sections = _extract_sections(old)
+    new_sections = _extract_sections(new)
+    old_headings = set(old_sections)
+    new_headings = set(new_sections)
+
+    changes = []
+    for h in sorted(new_headings - old_headings):
+        changes.append((h, "added"))
+    for h in sorted(old_headings - new_headings):
+        changes.append((h, "removed"))
+    for h in sorted(old_headings & new_headings):
+        if old_sections[h].rstrip() != new_sections[h].rstrip():
+            changes.append((h, "modified"))
+
+    # If no section-level changes but content differs, report as top-level edit
+    if not changes and old != new:
+        changes.append(("(document)", "modified"))
+
+    return changes
+
+
+def _extract_sections(content: str) -> dict[str, str]:
+    """Extract a dict of heading → section content (including the heading line)."""
+    fenced = _fenced_ranges(content)
+    headings = []
+    for m in _HEADING_RE.finditer(content):
+        if not _in_fenced_block(m.start(), fenced):
+            headings.append((m.start(), m.group().strip()))
+
+    if not headings:
+        return {}
+
+    sections = {}
+    for i, (start, heading) in enumerate(headings):
+        end = headings[i + 1][0] if i + 1 < len(headings) else len(content)
+        sections[heading] = content[start:end]
+    return sections
 
 
 def find_section(content: str, heading: str) -> tuple[int, int] | None:

@@ -13,6 +13,7 @@ import uvicorn
 from anyio import Event
 from pycrdt import Doc, Text, YMessageType, YSyncMessageType
 
+from tafelmusik import authors
 from tafelmusik.asgi_server import create_app
 from tafelmusik.conftest import MockChannel, connect_peer, get_free_port
 from tafelmusik.mcp_server import AppState, _sync_loop
@@ -245,7 +246,9 @@ async def test_replace_section_via_mcp(server):
         conn.text += "# Doc\n\nIntro\n\n## API\n\nOld API text\n\n## Usage\n\nUsage text\n"
         await asyncio.sleep(0.3)
 
-        document.replace_section(conn.text, "## API\n\nNew API documentation\n", author="test")
+        document.replace_section(
+            conn.text, "## API\n\nNew API documentation\n", author=authors.TEST
+        )
         content = str(conn.text)
         assert "New API documentation" in content
         assert "Old API text" not in content
@@ -261,7 +264,7 @@ async def test_replace_all_via_mcp(server):
         conn.text += "Old content that should be gone"
         await asyncio.sleep(0.3)
 
-        document.replace_all(conn.text, "# Fresh Start\n\nCompletely new.\n", author="test")
+        document.replace_all(conn.text, "# Fresh Start\n\nCompletely new.\n", author=authors.TEST)
         content = str(conn.text)
         assert "Fresh Start" in content
         assert "Old content" not in content
@@ -394,6 +397,127 @@ async def test_reconnect_after_server_restart(tmp_path):
         srv2.should_exit = True
         await asyncio.sleep(0.5)
         task2.cancel()
+
+
+# --- Observer tests: change_queue and origin filtering ---
+
+
+async def test_observer_notifies_on_remote_edit(server):
+    """Browser edits produce pending notifications after debounce."""
+    async with make_state(server) as state:
+        conn = await state.connect("observer-test")
+        assert len(conn.pending_notifications) == 0
+
+        # Simulate a browser edit via connect_peer
+        async with connect_peer(server, "observer-test") as browser:
+            browser += "Hello from Sameer"
+            await asyncio.sleep(0.5)
+
+        # Wait for debounce (2s) + margin
+        await asyncio.sleep(3.0)
+        assert len(conn.pending_notifications) > 0
+
+
+async def test_observer_skips_claude_edits(server):
+    """Claude's own edits (origin='claude') produce no notifications."""
+    from tafelmusik import document
+
+    async with make_state(server) as state:
+        conn = await state.connect("self-filter-test")
+
+        # Claude writes — should produce no notification
+        document.replace_all(
+            conn.text, "# Claude's doc\n\nWritten by Claude.\n", author=authors.CLAUDE
+        )
+
+        # Wait longer than debounce to confirm nothing arrives
+        await asyncio.sleep(3.0)
+        assert len(conn.pending_notifications) == 0, "Claude's edit should not notify"
+
+
+async def test_observer_notifies_remote_but_not_claude(server):
+    """Mixed scenario: Claude writes, then browser writes. Only browser edit notifies."""
+    from tafelmusik import document
+
+    async with make_state(server) as state:
+        conn = await state.connect("mixed-test")
+
+        # Claude writes first
+        document.replace_all(conn.text, "## Draft\n\nClaude's content.\n", author=authors.CLAUDE)
+        await asyncio.sleep(3.0)
+        assert len(conn.pending_notifications) == 0
+
+        # Browser edits
+        async with connect_peer(server, "mixed-test") as browser:
+            browser += "\nSameer added this."
+            await asyncio.sleep(0.5)
+
+        # Wait for debounce
+        await asyncio.sleep(3.0)
+        assert len(conn.pending_notifications) > 0
+
+
+async def test_consumer_debounces_and_diffs(server):
+    """The change consumer debounces rapid edits and produces section-level diffs."""
+    from tafelmusik import document
+
+    async with make_state(server) as state:
+        conn = await state.connect("debounce-test")
+
+        # Claude writes initial content with sections
+        document.replace_all(
+            conn.text,
+            "## API\n\nOriginal API docs.\n\n## Usage\n\nUsage text.\n",
+            author=authors.CLAUDE,
+        )
+        await asyncio.sleep(0.5)
+        assert conn.change_queue.empty()  # Claude's edit not queued
+
+        # Browser edits the API section
+        async with connect_peer(server, "debounce-test") as browser:
+            # Find and replace the API section content
+            content = str(browser)
+            api_end = content.index("## Usage")
+            del browser[0:api_end]
+            browser.insert(0, "## API\n\nBrowser rewrote API.\n\n")
+            await asyncio.sleep(0.5)
+
+        # Wait for debounce (2s default) + margin
+        await asyncio.sleep(3.0)
+
+        # Consumer should have processed the change into pending_notifications
+        assert len(conn.pending_notifications) > 0
+        changes = conn.pending_notifications[0]
+        headings = [h for h, _ in changes]
+        assert "## API" in headings
+
+
+async def test_consumer_coalesces_rapid_edits(server):
+    """Multiple rapid edits within the debounce window produce one notification."""
+    from tafelmusik import document
+
+    async with make_state(server) as state:
+        conn = await state.connect("coalesce-test")
+
+        document.replace_all(
+            conn.text,
+            "## Notes\n\nOriginal notes.\n",
+            author=authors.CLAUDE,
+        )
+        await asyncio.sleep(0.5)
+
+        # Browser sends 5 rapid edits (within debounce window)
+        async with connect_peer(server, "coalesce-test") as browser:
+            for i in range(5):
+                browser += f"\nEdit {i}"
+                await asyncio.sleep(0.1)
+            await asyncio.sleep(0.3)
+
+        # Wait for debounce
+        await asyncio.sleep(3.0)
+
+        # Should produce exactly 1 notification, not 5
+        assert len(conn.pending_notifications) == 1
 
 
 # --- TCP partition proxy for keepalive integration test ---

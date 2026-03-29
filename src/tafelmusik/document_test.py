@@ -4,7 +4,7 @@ from hypothesis import given
 from hypothesis.strategies import composite, integers, lists, text
 from pycrdt import Doc, Text
 
-from tafelmusik import document
+from tafelmusik import authors, document
 
 
 def _make_text(content: str = "") -> Text:
@@ -34,19 +34,19 @@ def test_read_content():
 
 def test_replace_all_empty_to_content():
     text = _make_text()
-    document.replace_all(text, "New content", author="test")
+    document.replace_all(text, "New content", author=authors.TEST)
     assert str(text) == "New content"
 
 
 def test_replace_all_content_to_content():
     text = _make_text("Old stuff")
-    document.replace_all(text, "New stuff", author="test")
+    document.replace_all(text, "New stuff", author=authors.TEST)
     assert str(text) == "New stuff"
 
 
 def test_replace_all_content_to_empty():
     text = _make_text("Something here")
-    document.replace_all(text, "", author="test")
+    document.replace_all(text, "", author=authors.TEST)
     assert str(text) == ""
 
 
@@ -138,7 +138,7 @@ def test_find_section_unclosed_fence():
 
 def test_replace_section_existing():
     text = _make_text("# Title\n\nIntro\n\n## API\n\nOld API docs\n\n## Usage\n\nUsage text\n")
-    replaced = document.replace_section(text, "## API\n\nNew API docs\n", author="test")
+    replaced = document.replace_section(text, "## API\n\nNew API docs\n", author=authors.TEST)
     assert replaced is True
     result = str(text)
     assert "New API docs" in result
@@ -148,7 +148,9 @@ def test_replace_section_existing():
 
 def test_replace_section_append_when_missing():
     text = _make_text("# Title\n\nIntro\n")
-    replaced = document.replace_section(text, "## New Section\n\nNew content\n", author="test")
+    replaced = document.replace_section(
+        text, "## New Section\n\nNew content\n", author=authors.TEST
+    )
     assert replaced is False
     result = str(text)
     assert result.endswith("## New Section\n\nNew content\n")
@@ -158,14 +160,14 @@ def test_replace_section_append_when_missing():
 
 def test_replace_section_append_to_empty():
     text = _make_text()
-    replaced = document.replace_section(text, "## First\n\nContent\n", author="test")
+    replaced = document.replace_section(text, "## First\n\nContent\n", author=authors.TEST)
     assert replaced is False
     assert str(text) == "## First\n\nContent\n"
 
 
 def test_replace_section_last_section():
     text = _make_text("## A\n\nBody A\n\n## B\n\nBody B\n")
-    replaced = document.replace_section(text, "## B\n\nNew B content\n", author="test")
+    replaced = document.replace_section(text, "## B\n\nNew B content\n", author=authors.TEST)
     assert replaced is True
     result = str(text)
     assert "Body A" in result
@@ -175,7 +177,7 @@ def test_replace_section_last_section():
 
 def test_replace_section_preserves_subsections_of_peer():
     text = _make_text("## A\n\nBody A\n\n### A.1\n\nNested\n\n## B\n\nBody B\n")
-    replaced = document.replace_section(text, "## A\n\nReplaced A\n", author="test")
+    replaced = document.replace_section(text, "## A\n\nReplaced A\n", author=authors.TEST)
     assert replaced is True
     result = str(text)
     assert "Replaced A" in result
@@ -186,7 +188,7 @@ def test_replace_section_preserves_subsections_of_peer():
 
 def test_replace_section_content_without_trailing_newline():
     text = _make_text("## A\n\nOld\n\n## B\n\nBody B\n")
-    replaced = document.replace_section(text, "## A\n\nNew content", author="test")
+    replaced = document.replace_section(text, "## A\n\nNew content", author=authors.TEST)
     assert replaced is True
     result = str(text)
     # Should still work even without trailing newline
@@ -197,7 +199,7 @@ def test_replace_section_content_without_trailing_newline():
 def test_replace_section_append_doc_no_trailing_newline():
     """Appending to a doc that doesn't end with a newline adds separator."""
     text = _make_text("# Title\n\nIntro")  # no trailing newline
-    replaced = document.replace_section(text, "## New\n\nContent\n", author="test")
+    replaced = document.replace_section(text, "## New\n\nContent\n", author=authors.TEST)
     assert replaced is False
     result = str(text)
     assert "\n\n## New" in result
@@ -206,7 +208,7 @@ def test_replace_section_append_doc_no_trailing_newline():
 def test_replace_section_append_doc_single_trailing_newline():
     """Appending to a doc ending with one newline adds one more."""
     text = _make_text("# Title\n\nIntro\n")  # single trailing newline
-    replaced = document.replace_section(text, "## New\n\nContent\n", author="test")
+    replaced = document.replace_section(text, "## New\n\nContent\n", author=authors.TEST)
     assert replaced is False
     result = str(text)
     assert "Intro\n\n## New" in result
@@ -215,7 +217,7 @@ def test_replace_section_append_doc_single_trailing_newline():
 def test_replace_section_append_doc_double_trailing_newline():
     """Appending to a doc already ending with \\n\\n adds no extra whitespace."""
     text = _make_text("# Title\n\nIntro\n\n")  # already double newline
-    replaced = document.replace_section(text, "## New\n\nContent\n", author="test")
+    replaced = document.replace_section(text, "## New\n\nContent\n", author=authors.TEST)
     assert replaced is False
     result = str(text)
     assert "Intro\n\n## New" in result
@@ -257,7 +259,7 @@ def test_prop_heading_preserved_after_replace(level, new_body, existing_body):
     new_content = _build_section(heading, new_body)
 
     text = _make_text(existing)
-    document.replace_section(text, new_content, author="test")
+    document.replace_section(text, new_content, author=authors.TEST)
     assert heading in str(text)
 
 
@@ -278,7 +280,7 @@ def test_prop_replace_preserves_other_sections(level, body_a, body_b, body_c):
     doc = "\n".join(sections)
 
     text = _make_text(doc)
-    document.replace_section(text, f"{prefix} Beta\n\nReplaced body\n", author="test")
+    document.replace_section(text, f"{prefix} Beta\n\nReplaced body\n", author=authors.TEST)
     result = str(text)
 
     assert f"{prefix} Alpha" in result
@@ -295,9 +297,9 @@ def test_prop_idempotent_double_replace(level, body):
     doc = other + "\n" + section
 
     text = _make_text(doc)
-    document.replace_section(text, section, author="test")
+    document.replace_section(text, section, author=authors.TEST)
     after_first = str(text)
-    document.replace_section(text, section, author="test")
+    document.replace_section(text, section, author=authors.TEST)
     after_second = str(text)
 
     assert after_first == after_second
@@ -311,7 +313,7 @@ def test_prop_find_after_replace(level, body, new_body):
     new_content = _build_section(heading, new_body)
 
     text = _make_text(original)
-    document.replace_section(text, new_content, author="test")
+    document.replace_section(text, new_content, author=authors.TEST)
     result = str(text)
 
     bounds = document.find_section(result, heading)
@@ -340,7 +342,7 @@ def test_prop_replace_subsumes_children(parent_level, parent_body, child_body, s
     doc = "\n".join(sections)
 
     text = _make_text(doc)
-    document.replace_section(text, f"{pp} Parent\n\nNew parent body\n", author="test")
+    document.replace_section(text, f"{pp} Parent\n\nNew parent body\n", author=authors.TEST)
     result = str(text)
 
     assert f"{pp} Parent" in result
@@ -362,7 +364,7 @@ def test_prop_append_creates_findable_section(level, existing_body, new_body):
     new_section = _build_section(new_heading, new_body)
 
     text = _make_text(existing)
-    replaced = document.replace_section(text, new_section, author="test")
+    replaced = document.replace_section(text, new_section, author=authors.TEST)
     assert replaced is False  # appended, not replaced
 
     bounds = document.find_section(str(text), new_heading)

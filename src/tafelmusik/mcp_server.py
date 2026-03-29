@@ -23,7 +23,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 from anyio import Event, create_task_group, sleep
@@ -39,7 +39,7 @@ from pycrdt import (
     handle_sync_message,
 )
 
-from tafelmusik import document
+from tafelmusik import authors, document
 
 log = logging.getLogger(__name__)
 
@@ -161,6 +161,45 @@ async def _sync_loop(
         tg.cancel_scope.cancel()
 
 
+# --- Change observer: debounce + section diff ---
+
+
+async def _change_consumer(
+    conn: RoomConnection,
+    room: str,
+    debounce: float = 2.0,
+) -> None:
+    """Consume change events, debounce, and produce section-level diffs.
+
+    Waits for silence (no new changes for ``debounce`` seconds) before
+    processing. Accumulates old→new across rapid edits so the diff
+    reflects the full change, not each keystroke.
+    """
+    while True:
+        # Wait for first change
+        first_old, _ = await conn.change_queue.get()
+        latest_new = None
+
+        # Drain additional changes within the debounce window
+        while True:
+            try:
+                _, latest_new_candidate = await asyncio.wait_for(
+                    conn.change_queue.get(), timeout=debounce
+                )
+                latest_new = latest_new_candidate
+            except TimeoutError:
+                break
+
+        # Use current text if no additional changes arrived
+        if latest_new is None:
+            latest_new = str(conn.text)
+
+        changes = document.diff_sections(first_old, latest_new)
+        if changes:
+            log.info("Room %s: remote edit — %s", room, changes)
+            conn.pending_notifications.append(changes)
+
+
 # --- Connection management ---
 
 
@@ -172,6 +211,10 @@ class RoomConnection:
     sync status and liveness. The sync loop runs in a background task that
     also owns the WebSocket — they share the same asyncio Task to avoid
     anyio cancel scope cross-task violations.
+
+    The change_queue receives remote edits (origin != "claude") for
+    notification to the user. Populated by a synchronous text.observe()
+    callback; consumed by an async task that debounces and diffs.
     """
 
     doc: Doc
@@ -179,8 +222,18 @@ class RoomConnection:
     synced: Event
     dead: Event
     _task: asyncio.Task
+    change_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    pending_notifications: list = field(default_factory=list)
+    _cached_content: str = ""
+    _consumer_task: asyncio.Task | None = None
+    _observe_subscription: Any = None
 
     async def close(self) -> None:
+        if self._observe_subscription is not None:
+            self.text.unobserve(self._observe_subscription)
+            self._observe_subscription = None
+        if self._consumer_task and not self._consumer_task.done():
+            self._consumer_task.cancel()
         if not self._task.done():
             self._task.cancel()
         try:
@@ -285,7 +338,31 @@ class AppState:
             synced=synced,
             dead=dead,
             _task=task,
+            _cached_content=str(text),
         )
+
+        def _on_text_change(event, txn):
+            """Synchronous observe callback — queues remote edits only.
+
+            Always updates the content cache (so diffs are accurate),
+            but only queues changes that weren't made by Claude.
+
+            Wrapped in try/except because an unhandled exception here
+            would propagate as an ExceptionGroup when the transaction
+            commits, crashing the sync loop.
+            """
+            try:
+                old_content = conn._cached_content
+                new_content = str(text)
+                conn._cached_content = new_content
+                if txn.origin != authors.CLAUDE:
+                    conn.change_queue.put_nowait((old_content, new_content))
+            except Exception:
+                log.warning("Observer callback failed for room", exc_info=True)
+
+        conn._observe_subscription = text.observe(_on_text_change)
+        conn._consumer_task = asyncio.create_task(_change_consumer(conn, room))
+
         self.rooms[room] = conn
         return conn
 
@@ -353,13 +430,14 @@ async def edit_doc(room: str, content: str, mode: str, ctx: Context) -> str:
     conn = await state.connect(room)
 
     if mode == "append":
-        conn.text.insert(len(str(conn.text)), content, attrs={"author": "claude"})
+        with conn.doc.transaction(origin="claude"):
+            conn.text.insert(len(str(conn.text)), content, attrs={"author": "claude"})
         return f"Appended {len(content)} chars to '{room}'"
     elif mode == "replace_all":
-        document.replace_all(conn.text, content, author="claude")
+        document.replace_all(conn.text, content, author=authors.CLAUDE)
         return f"Replaced all content in '{room}' ({len(content)} chars)"
     elif mode == "replace_section":
-        replaced = document.replace_section(conn.text, content, author="claude")
+        replaced = document.replace_section(conn.text, content, author=authors.CLAUDE)
         heading = content.split("\n", 1)[0].strip()
         verb = "Replaced existing" if replaced else "Appended new"
         return f"{verb} section '{heading}' in '{room}'"
@@ -380,7 +458,7 @@ async def load_doc(room: str, markdown: str, ctx: Context) -> str:
     """
     state = _get_state(ctx)
     conn = await state.connect(room)
-    document.replace_all(conn.text, markdown, author="claude")
+    document.replace_all(conn.text, markdown, author=authors.CLAUDE)
     return f"Loaded {len(markdown)} chars into '{room}'"
 
 
