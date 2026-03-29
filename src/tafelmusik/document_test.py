@@ -1,5 +1,7 @@
 """Tests for Y.Text document operations."""
 
+from hypothesis import given
+from hypothesis.strategies import composite, integers, lists, text
 from pycrdt import Doc, Text
 
 from tafelmusik import document
@@ -94,6 +96,43 @@ def test_find_section_not_a_heading():
     assert document.find_section(content, "Some text") is None
 
 
+def test_find_section_ignores_headings_in_code_blocks():
+    """Headings inside fenced code blocks don't affect section boundaries."""
+    content = (
+        "## API\n\n"
+        "```python\n"
+        "# This is a comment\n"
+        "def foo():\n"
+        "    pass\n"
+        "```\n\n"
+        "## Usage\n\n"
+        "Use it.\n"
+    )
+    start, end = document.find_section(content, "## API")
+    section = content[start:end]
+    # Section should include the code block — # comment is not a heading
+    assert "# This is a comment" in section
+    assert "def foo" in section
+    # Section should stop at ## Usage
+    assert "## Usage" not in section
+
+
+def test_find_section_ignores_headings_in_tilde_fence():
+    content = "## Notes\n\n~~~\n# shell comment\n~~~\n\n## End\n"
+    start, end = document.find_section(content, "## Notes")
+    section = content[start:end]
+    assert "# shell comment" in section
+    assert "## End" not in section
+
+
+def test_find_section_unclosed_fence():
+    """Unclosed fence treats rest of document as code."""
+    content = "## Start\n\n```\n# not a heading\n## Also not\n"
+    start, end = document.find_section(content, "## Start")
+    # Everything after the fence is code — section extends to end
+    assert end == len(content)
+
+
 # --- replace_section ---
 
 
@@ -180,3 +219,151 @@ def test_replace_section_append_doc_double_trailing_newline():
     assert replaced is False
     result = str(text)
     assert "Intro\n\n## New" in result
+
+
+# --- Property-based tests (Hypothesis) ---
+
+# Body text alphabet — no # so lines can't be mistaken for headings
+_BODY_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789 .,!?"
+
+
+@composite
+def md_body(draw):
+    """Generate body text that can't be confused for a heading."""
+    lines = draw(lists(
+        text(alphabet=_BODY_CHARS, min_size=0, max_size=40),
+        min_size=0,
+        max_size=3,
+    ))
+    return "\n".join(lines)
+
+
+def _build_section(heading: str, body: str) -> str:
+    """Build a markdown section from heading line and body text."""
+    if body.strip():
+        return heading + "\n\n" + body + "\n"
+    return heading + "\n"
+
+
+@given(
+    level=integers(min_value=1, max_value=4),
+    new_body=md_body(),
+    existing_body=md_body(),
+)
+def test_prop_heading_preserved_after_replace(level, new_body, existing_body):
+    """After replace_section, the target heading always appears in the result."""
+    heading = "#" * level + " Target"
+    existing = _build_section(heading, existing_body)
+    new_content = _build_section(heading, new_body)
+
+    text = _make_text(existing)
+    document.replace_section(text, new_content)
+    assert heading in str(text)
+
+
+@given(
+    level=integers(min_value=1, max_value=4),
+    body_a=md_body(),
+    body_b=md_body(),
+    body_c=md_body(),
+)
+def test_prop_replace_preserves_other_sections(level, body_a, body_b, body_c):
+    """Replacing one section does not disturb other sections at the same level."""
+    prefix = "#" * level
+    sections = [
+        _build_section(f"{prefix} Alpha", body_a),
+        _build_section(f"{prefix} Beta", body_b),
+        _build_section(f"{prefix} Gamma", body_c),
+    ]
+    doc = "\n".join(sections)
+
+    text = _make_text(doc)
+    document.replace_section(text, f"{prefix} Beta\n\nReplaced body\n")
+    result = str(text)
+
+    assert f"{prefix} Alpha" in result
+    assert f"{prefix} Gamma" in result
+    assert "Replaced body" in result
+
+
+@given(level=integers(min_value=1, max_value=4), body=md_body())
+def test_prop_idempotent_double_replace(level, body):
+    """Replacing a section with itself twice leaves the document unchanged."""
+    heading = "#" * level + " Idem"
+    section = _build_section(heading, body)
+    other = "#" * level + " Other\n\nKeep me\n"
+    doc = other + "\n" + section
+
+    text = _make_text(doc)
+    document.replace_section(text, section)
+    after_first = str(text)
+    document.replace_section(text, section)
+    after_second = str(text)
+
+    assert after_first == after_second
+
+
+@given(level=integers(min_value=1, max_value=4), body=md_body(), new_body=md_body())
+def test_prop_find_after_replace(level, body, new_body):
+    """After replacing, find_section locates the section starting with the heading."""
+    heading = "#" * level + " Findable"
+    original = _build_section(heading, body)
+    new_content = _build_section(heading, new_body)
+
+    text = _make_text(original)
+    document.replace_section(text, new_content)
+    result = str(text)
+
+    bounds = document.find_section(result, heading)
+    assert bounds is not None, f"Heading '{heading}' not found after replace"
+    section_text = result[bounds[0] : bounds[1]]
+    assert section_text.startswith(heading)
+
+
+@given(
+    parent_level=integers(min_value=1, max_value=3),
+    parent_body=md_body(),
+    child_body=md_body(),
+    sibling_body=md_body(),
+)
+def test_prop_replace_subsumes_children(parent_level, parent_body, child_body, sibling_body):
+    """Replacing a section also replaces its subsections (lower-level headings)."""
+    child_level = parent_level + 1
+    pp = "#" * parent_level
+    pc = "#" * child_level
+
+    sections = [
+        _build_section(f"{pp} Parent", parent_body),
+        _build_section(f"{pc} Child", child_body),
+        _build_section(f"{pp} Sibling", sibling_body),
+    ]
+    doc = "\n".join(sections)
+
+    text = _make_text(doc)
+    document.replace_section(text, f"{pp} Parent\n\nNew parent body\n")
+    result = str(text)
+
+    assert f"{pp} Parent" in result
+    assert "New parent body" in result
+    assert f"{pc} Child" not in result  # child was inside Parent's section
+    assert f"{pp} Sibling" in result
+
+
+@given(
+    level=integers(min_value=1, max_value=4),
+    existing_body=md_body(),
+    new_body=md_body(),
+)
+def test_prop_append_creates_findable_section(level, existing_body, new_body):
+    """Appending a new section (heading not found) makes it findable."""
+    prefix = "#" * level
+    existing = _build_section(f"{prefix} Existing", existing_body)
+    new_heading = f"{prefix} Appended"
+    new_section = _build_section(new_heading, new_body)
+
+    text = _make_text(existing)
+    replaced = document.replace_section(text, new_section)
+    assert replaced is False  # appended, not replaced
+
+    bounds = document.find_section(str(text), new_heading)
+    assert bounds is not None, f"Appended heading '{new_heading}' not findable"

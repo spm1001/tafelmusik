@@ -394,3 +394,117 @@ async def test_reconnect_after_server_restart(tmp_path):
         srv2.should_exit = True
         await asyncio.sleep(0.5)
         task2.cancel()
+
+
+# --- TCP partition proxy for keepalive integration test ---
+
+
+@asynccontextmanager
+async def _partition_proxy(target_port):
+    """TCP proxy that simulates network partition.
+
+    Yields (proxy_port, partition_fn, heal_fn). While partitioned,
+    silently drops all traffic without closing TCP connections — the
+    client sees silence, not an error.
+    """
+    proxy_port = get_free_port()
+    dropping = [False]
+    relay_tasks = []
+
+    async def _relay(src, dst):
+        try:
+            while True:
+                data = await src.read(8192)
+                if not data:
+                    break
+                if not dropping[0]:
+                    dst.write(data)
+                    await dst.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
+            pass
+
+    async def _handle(client_reader, client_writer):
+        try:
+            target_reader, target_writer = await asyncio.open_connection(
+                "127.0.0.1", target_port
+            )
+        except OSError:
+            client_writer.close()
+            return
+        relay_tasks.append(asyncio.create_task(_relay(client_reader, target_writer)))
+        relay_tasks.append(asyncio.create_task(_relay(target_reader, client_writer)))
+
+    srv = await asyncio.start_server(_handle, "127.0.0.1", proxy_port)
+
+    def partition():
+        dropping[0] = True
+
+    def heal():
+        dropping[0] = False
+
+    try:
+        yield proxy_port, partition, heal
+    finally:
+        for t in relay_tasks:
+            t.cancel()
+        srv.close()
+        await srv.wait_closed()
+
+
+async def test_keepalive_detects_dead_connection(tmp_path):
+    """Keepalive detects a silently dead connection via network partition.
+
+    A TCP proxy between client and server is partitioned mid-session.
+    The keepalive probe is sent but dropped — no response comes back.
+    The dead event fires within the keepalive window. After healing the
+    partition, reconnection restores persisted data.
+    """
+    import time
+
+    db_path = tmp_path / "keepalive-int.db"
+    (tmp_path / "index.html").write_text("<html></html>")
+    server_port = get_free_port()
+
+    app = create_app(db_path=db_path, public_dir=tmp_path)
+    config = uvicorn.Config(app, host="127.0.0.1", port=server_port, log_level="error")
+    srv = uvicorn.Server(config)
+    server_task = asyncio.create_task(srv.serve())
+    await asyncio.sleep(1)
+
+    try:
+        async with _partition_proxy(server_port) as (proxy_port, partition, heal):
+            async with httpx.AsyncClient() as client:
+                state = AppState(
+                    client=client,
+                    server_url=f"ws://127.0.0.1:{proxy_port}",
+                    keepalive=0.5,
+                )
+
+                # Connect and write through proxy
+                conn = await state.connect("keepalive-test")
+                conn.text += "# Keepalive\n\nSurvives partition.\n"
+                await asyncio.sleep(0.5)
+
+                # Partition — keepalive should detect within ~1s
+                # (probe at 0.5s, wait min(0.5, 10)=0.5s for response → dead at ~1s)
+                start = time.monotonic()
+                partition()
+
+                await asyncio.wait_for(conn.dead.wait(), timeout=5.0)
+                elapsed = time.monotonic() - start
+                assert elapsed < 3.0, f"Dead took {elapsed:.1f}s, expected ~1s"
+
+                # Heal partition, reconnect
+                heal()
+                conn2 = await state.connect("keepalive-test")
+                assert conn2 is not conn
+                content = str(conn2.text)
+                assert "Survives partition." in content, (
+                    f"Expected persisted content, got: {content!r}"
+                )
+
+                await state.close_all()
+    finally:
+        srv.should_exit = True
+        await asyncio.sleep(0.5)
+        server_task.cancel()

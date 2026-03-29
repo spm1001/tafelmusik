@@ -259,7 +259,7 @@ def create_app(
         finally:
             await manager.close()
 
-    return Starlette(
+    app = Starlette(
         lifespan=lifespan,
         routes=[
             Route("/api/rooms", list_rooms),
@@ -267,6 +267,8 @@ def create_app(
             Mount("/", StaticFiles(directory=str(public_dir), html=True)),
         ],
     )
+    app.state.manager = manager
+    return app
 
 
 # Default app for `uvicorn tafelmusik.asgi_server:app`
