@@ -28,7 +28,7 @@ from anyio import Event
 from httpx_ws import aconnect_ws
 from mcp.server.fastmcp import Context, FastMCP
 from pycrdt import Doc, Text
-from pycrdt._sync import (
+from pycrdt import (
     YMessageType,
     YSyncMessageType,
     create_sync_message,

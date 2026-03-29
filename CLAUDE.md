@@ -39,6 +39,7 @@ cd public && npx esbuild cm-entry.js --bundle --outfile=editor.js --minify  # Re
 
 ## Key Conventions
 
+- **Private APIs:** When using library internals (underscore-prefixed), add a comment block naming the private APIs, the validated version, and a runtime assertion. File a bon to own the functionality via public APIs. Don't block on it — ship first, own later.
 - **Port:** 3456 (ASGI server). MCP/channel servers discover via `TAFELMUSIK_URL` env var.
 - **Persistence:** SQLiteYStore stores updates (not documents). Squashes after 60s idle. See `.bon/understanding.md` for the full mental model.
 - **Version:** Single source in `.claude-plugin/plugin.json`.
