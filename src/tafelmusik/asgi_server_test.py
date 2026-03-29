@@ -116,3 +116,56 @@ async def test_http_serves_index(server):
         r = await client.get(f"http://127.0.0.1:{port}/")
         assert r.status_code == 200
         assert "<html>" in r.text
+
+
+async def test_persistence_across_restart(tmp_path):
+    """Content written to one server instance is restored by a fresh instance."""
+    db_path = tmp_path / "persist.db"
+    (tmp_path / "index.html").write_text("<html></html>")
+    port = 13471
+
+    # Server 1: write content
+    app1 = create_app(db_path=db_path, public_dir=tmp_path)
+    config1 = uvicorn.Config(app1, host="127.0.0.1", port=port, log_level="error")
+    srv1 = uvicorn.Server(config1)
+    task1 = asyncio.create_task(srv1.serve())
+    await asyncio.sleep(1)
+
+    doc1 = Doc()
+    doc1["content"] = t1 = Text()
+    async with httpx.AsyncClient() as client:
+        async with aconnect_ws(f"http://127.0.0.1:{port}/persist-test", client) as ws:
+            ch = HttpxWebsocket(ws, "persist-test")
+            p = Provider(doc1, ch)
+            asyncio.create_task(p.start())
+            await asyncio.sleep(0.5)
+            t1 += "# Persistence\n\nSurvives restart."
+            await asyncio.sleep(0.5)
+            await p.stop()
+
+    srv1.should_exit = True
+    await asyncio.sleep(0.5)
+    task1.cancel()
+
+    # Server 2: fresh app, same db_path — content should be restored
+    app2 = create_app(db_path=db_path, public_dir=tmp_path)
+    config2 = uvicorn.Config(app2, host="127.0.0.1", port=port, log_level="error")
+    srv2 = uvicorn.Server(config2)
+    task2 = asyncio.create_task(srv2.serve())
+    await asyncio.sleep(1)
+
+    doc2 = Doc()
+    doc2["content"] = t2 = Text()
+    async with httpx.AsyncClient() as client:
+        async with aconnect_ws(f"http://127.0.0.1:{port}/persist-test", client) as ws:
+            ch = HttpxWebsocket(ws, "persist-test")
+            p = Provider(doc2, ch)
+            asyncio.create_task(p.start())
+            await asyncio.sleep(1)
+            result = str(t2)
+            assert "Survives restart." in result, f"Expected persisted content, got: {result!r}"
+            await p.stop()
+
+    srv2.should_exit = True
+    await asyncio.sleep(0.5)
+    task2.cancel()
