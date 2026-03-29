@@ -3,78 +3,123 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from pycrdt import Doc
 from pycrdt.store import SQLiteYStore
 from pycrdt.store.base import YDocNotFound
-from pycrdt.websocket import ASGIServer, WebsocketServer
+from pycrdt.websocket import WebsocketServer
 from pycrdt.websocket.yroom import YRoom
 from starlette.applications import Starlette
-from starlette.routing import Mount
+from starlette.routing import Mount, WebSocketRoute
 from starlette.staticfiles import StaticFiles
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 PORT = 3456
 ROOT = Path(__file__).resolve().parent.parent.parent
-PUBLIC_DIR = ROOT / "public"
-DATA_DIR = ROOT / "data"
 
 
-class TafelmusikStore(SQLiteYStore):
-    db_path = str(DATA_DIR / "tafelmusik.db")
+# --- Channel adapter: Starlette WebSocket → pycrdt Channel interface ---
+
+
+class StarletteWebsocket:
+    """Adapts a Starlette WebSocket to the pycrdt Channel interface."""
+
+    def __init__(self, websocket: WebSocket, path: str):
+        self._ws = websocket
+        self._path = path
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return await self._ws.receive_bytes()
+        except WebSocketDisconnect:
+            raise StopAsyncIteration()
+
+    async def send(self, message: bytes) -> None:
+        await self._ws.send_bytes(message)
+
+
+# --- Persistence: restore Y.Doc from SQLiteYStore ---
+
+
+async def _restore_ydoc(store_cls: type[SQLiteYStore], path: str) -> Doc:
+    """Create a Doc populated with any persisted state from the store."""
+    doc = Doc()
+    store = store_cls(path=path)
+    async with store:
+        try:
+            await store.apply_updates(doc)
+        except YDocNotFound:
+            pass  # Fresh room, no prior content
+    return doc
+
+
+# --- WebsocketServer with SQLite persistence ---
 
 
 class TafelmusikWebsocketServer(WebsocketServer):
-    """WebsocketServer subclass that creates rooms with SQLiteYStore persistence.
+    """WebsocketServer that creates rooms with SQLiteYStore persistence.
 
-    Rooms start with ready=False. Once the store is initialized (by YRoom internals),
-    we restore persisted state via store.apply_updates(), then set ready=True so
-    clients can sync.
+    Follows the make_ydoc pattern from pycrdt-websocket's Django consumer:
+    pre-populate a Doc from the store, then pass both the Doc and a fresh
+    store instance to YRoom.
     """
+
+    def __init__(self, store_cls: type[SQLiteYStore], **kwargs):
+        super().__init__(**kwargs)
+        self._store_cls = store_cls
 
     async def get_room(self, name: str) -> YRoom:
         if name not in self.rooms:
-            store = TafelmusikStore(path=name)
-            room = YRoom(
-                ready=False,
-                ystore=store,
-                log=self.log,
-            )
-            self.rooms[name] = room
-            await self.start_room(room)
-            # Wait for YRoom's _broadcast_updates to start the store
-            await store.started.wait()
-            await store.db_initialized.wait()
-            # Restore persisted state (doc.observe not yet active since ready=False)
-            try:
-                await store.apply_updates(room.ydoc)
-            except YDocNotFound:
-                pass  # Fresh room, no prior content
-            room.ready = True
-        else:
-            room = self.rooms[name]
-            await self.start_room(room)
+            doc = await _restore_ydoc(self._store_cls, name)
+            store = self._store_cls(path=name)
+            self.rooms[name] = YRoom(ydoc=doc, ystore=store, log=self.log)
+        room = self.rooms[name]
+        await self.start_room(room)
         return room
 
 
-websocket_server = TafelmusikWebsocketServer()
-asgi_ws = ASGIServer(websocket_server)
+# --- App factory ---
 
 
-@asynccontextmanager
-async def lifespan(app):
-    async with websocket_server:
-        yield
+def create_app(
+    db_path: str | Path = ROOT / "data" / "tafelmusik.db",
+    public_dir: str | Path = ROOT / "public",
+) -> Starlette:
+    """Create the ASGI application with the given configuration."""
+
+    _db_path = str(db_path)
+    Store = type("Store", (SQLiteYStore,), {
+        "db_path": _db_path,
+        "squash_after_inactivity_of": 60,  # compact updates after 60s of no edits
+    })
+
+    ws_server = TafelmusikWebsocketServer(store_cls=Store)
+
+    async def websocket_endpoint(websocket: WebSocket):
+        room = websocket.path_params.get("room", "default")
+        await websocket.accept()
+        channel = StarletteWebsocket(websocket, room)
+        await ws_server.serve(channel)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with ws_server:
+            yield
+
+    return Starlette(
+        lifespan=lifespan,
+        routes=[
+            WebSocketRoute("/{room:path}", websocket_endpoint),
+            Mount("/", StaticFiles(directory=str(public_dir), html=True)),
+        ],
+    )
 
 
-http_app = Starlette(
-    lifespan=lifespan,
-    routes=[
-        Mount("/", StaticFiles(directory=PUBLIC_DIR, html=True)),
-    ],
-)
-
-
-async def app(scope, receive, send):
-    """ASGI dispatcher — websocket to pycrdt, everything else to starlette."""
-    if scope["type"] == "websocket":
-        await asgi_ws(scope, receive, send)
-    else:
-        await http_app(scope, receive, send)
+# Default app for `uvicorn tafelmusik.asgi_server:app`
+app = create_app()

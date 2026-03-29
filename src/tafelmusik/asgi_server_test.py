@@ -10,21 +10,15 @@ from pycrdt import Doc, Text
 from pycrdt.websocket.websocket import HttpxWebsocket
 from pycrdt.websocket.yroom import Provider
 
+from tafelmusik.asgi_server import create_app
+
 
 @pytest.fixture
-async def server(tmp_path, monkeypatch):
-    """Start a tafelmusik server on an ephemeral port with a temp DB."""
-    monkeypatch.setattr(
-        "tafelmusik.asgi_server.TafelmusikStore.db_path",
-        str(tmp_path / "test.db"),
-    )
-    # Reimport to pick up monkeypatched db_path
-    import importlib
-
-    import tafelmusik.asgi_server
-
-    importlib.reload(tafelmusik.asgi_server)
-    app = tafelmusik.asgi_server.app
+async def server(tmp_path):
+    """Start a tafelmusik server with a temp DB on an ephemeral port."""
+    app = create_app(db_path=tmp_path / "test.db", public_dir=tmp_path)
+    # Write a minimal index.html so static files mount works
+    (tmp_path / "index.html").write_text("<html></html>")
 
     port = 13470
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
@@ -35,45 +29,6 @@ async def server(tmp_path, monkeypatch):
     srv.should_exit = True
     await asyncio.sleep(0.5)
     task.cancel()
-
-
-async def _connect_client(port: int, room: str) -> tuple[Text, Provider]:
-    """Connect a pycrdt client to the server and return (text, provider)."""
-    doc = Doc()
-    doc["content"] = text = Text()
-    client = httpx.AsyncClient()
-    ws = await client.__aenter__()  # noqa — managed by caller
-    return text, None  # placeholder
-
-
-async def _write_and_read(port: int, room: str, content: str) -> str:
-    """Write content to a room via Yjs client, return what a second client reads."""
-    doc1 = Doc()
-    doc1["content"] = t1 = Text()
-
-    async with httpx.AsyncClient() as client:
-        async with aconnect_ws(f"http://127.0.0.1:{port}/{room}", client) as ws:
-            ch = HttpxWebsocket(ws, room)
-            p = Provider(doc1, ch)
-            asyncio.create_task(p.start())
-            await asyncio.sleep(0.5)
-            t1 += content
-            await asyncio.sleep(0.5)
-            await p.stop()
-
-    # Second client reads
-    doc2 = Doc()
-    doc2["content"] = t2 = Text()
-    async with httpx.AsyncClient() as client:
-        async with aconnect_ws(f"http://127.0.0.1:{port}/{room}", client) as ws:
-            ch = HttpxWebsocket(ws, room)
-            p = Provider(doc2, ch)
-            asyncio.create_task(p.start())
-            await asyncio.sleep(0.5)
-            result = str(t2)
-            await p.stop()
-
-    return result
 
 
 async def test_two_clients_sync(server):
@@ -113,10 +68,33 @@ async def test_multi_room(server):
     """Different rooms are independent."""
     port = server
 
-    await _write_and_read(port, "room-a", "Content A")
-    await _write_and_read(port, "room-b", "Content B")
+    # Write to room-a
+    doc_a = Doc()
+    doc_a["content"] = ta = Text()
+    async with httpx.AsyncClient() as client:
+        async with aconnect_ws(f"http://127.0.0.1:{port}/room-a", client) as ws:
+            ch = HttpxWebsocket(ws, "room-a")
+            p = Provider(doc_a, ch)
+            asyncio.create_task(p.start())
+            await asyncio.sleep(0.5)
+            ta += "Content A"
+            await asyncio.sleep(0.5)
+            await p.stop()
 
-    # Verify isolation
+    # Write to room-b
+    doc_b = Doc()
+    doc_b["content"] = tb = Text()
+    async with httpx.AsyncClient() as client:
+        async with aconnect_ws(f"http://127.0.0.1:{port}/room-b", client) as ws:
+            ch = HttpxWebsocket(ws, "room-b")
+            p = Provider(doc_b, ch)
+            asyncio.create_task(p.start())
+            await asyncio.sleep(0.5)
+            tb += "Content B"
+            await asyncio.sleep(0.5)
+            await p.stop()
+
+    # Read room-a — should not contain room-b's content
     doc = Doc()
     doc["content"] = text = Text()
     async with httpx.AsyncClient() as client:
@@ -129,3 +107,12 @@ async def test_multi_room(server):
             assert "Content A" in content
             assert "Content B" not in content
             await p.stop()
+
+
+async def test_http_serves_index(server):
+    """HTTP GET / serves index.html."""
+    port = server
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"http://127.0.0.1:{port}/")
+        assert r.status_code == 200
+        assert "<html>" in r.text
