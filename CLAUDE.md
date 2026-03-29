@@ -6,7 +6,7 @@ Collaborative editing layer — Yjs Y.Text + CodeMirror 6 + pycrdt. Both Sameer 
 
 Three processes, one codebase:
 
-1. **ASGI server** (`asgi_server.py`) — always-running (systemd). Holds Y.Doc, serves web editor, handles WebSocket sync.
+1. **ASGI server** (`asgi_server.py`) — always-running (systemd). Owns room management (Room + RoomManager), serves web editor, handles WebSocket sync. Zero pycrdt.websocket dependency — uses public pycrdt APIs only.
 2. **MCP server** (`mcp_server.py`) — ephemeral (spawned by CC). Connects to ASGI server via WebSocket as pycrdt client. Provides tools: `read_doc`, `edit_doc`, `load_doc`, `list_docs` (+ future: `add_comment`, `list_comments`, `export_to_docs`).
 3. **Channel server** (`channel_server.py`) — ephemeral (spawned by CC). Observes Y.Text changes, pushes notifications.
 
@@ -37,6 +37,25 @@ uv run ruff format src/                      # Format
 cd public && npx esbuild cm-entry.js --bundle --outfile=editor.js --minify  # Rebuild JS
 ```
 
+## Deployment
+
+Push-to-deploy on hezza. Three event-driven hooks in `deploy/`, all calling shared `restart-if-changed.sh`:
+
+| Hook | Trigger | When |
+|------|---------|------|
+| `post-commit` | Local commit on hezza | Claude session commits code |
+| `post-merge` | `git pull` merges changes | Manual or automated pull |
+| `post-receive` | Push from Mac via `git push hezza main` | Cross-machine deploy |
+
+All filter for non-test `src/tafelmusik/*.py` changes and health-check after restart. After re-cloning:
+```bash
+for hook in post-commit post-merge post-receive; do
+    ln -sf ../../deploy/$hook.sh .git/hooks/$hook
+done
+git config receive.denyCurrentBranch updateInstead  # accept pushes
+```
+Mac setup (one-time): `git remote add hezza modha@hezza:Repos/batterie/tafelmusik`
+
 ## Key Conventions
 
 - **Private APIs:** When using library internals (underscore-prefixed), add a comment block naming the private APIs, the validated version, and a runtime assertion. File a bon to own the functionality via public APIs. Don't block on it — ship first, own later.
@@ -48,18 +67,17 @@ cd public && npx esbuild cm-entry.js --bundle --outfile=editor.js --minify  # Re
 
 ## Gotchas
 
-- `WebsocketServer.start()` blocks forever — run as `asyncio.create_task()`, never `await` directly.
-- `get_room()` is a coroutine — must be awaited.
-- `HttpxWebsocket(ws, room_name)` wraps an existing httpx-ws connection, not a URL.
-- Import path is `from pycrdt.websocket import ...` NOT `from pycrdt_websocket import ...` (merged namespace in 0.16.0).
+- Neither the ASGI server nor the MCP server imports `pycrdt.websocket`. All sync protocol code uses public pycrdt APIs: `create_sync_message`, `handle_sync_message`, `create_update_message`, `doc.events()`.
 - `SQLiteYStore` is in `from pycrdt.store import SQLiteYStore`, NOT `pycrdt.websocket`.
-- YRoom does NOT auto-restore from ystore on startup. Use the two-instance pattern: transient store reads via `apply_updates()`, fresh store passed to YRoom for writes. See `_restore_ydoc()` in `asgi_server.py`.
+- SQLiteYStore does NOT auto-restore state. Use the two-instance pattern: transient store reads via `apply_updates()`, fresh store for ongoing writes. See `_restore_ydoc()` in `asgi_server.py`.
 - `SQLiteYStore.db_path` is a class variable. To set it dynamically, use `type("Store", (SQLiteYStore,), {"db_path": path})` — class bodies can't see enclosing function locals.
 - `StickyIndex.new(text, idx, Assoc.AFTER)` — constructor `StickyIndex(text, idx)` doesn't work.
 - `observe()` callbacks are synchronous — use `asyncio.Queue.put_nowait()` + async consumer.
 - Python MCP SDK: custom notifications require low-level `Server` API, not FastMCP.
 - `aconnect_ws` uses anyio cancel scopes that are task-bound. The WebSocket and sync loop must run in the SAME asyncio Task — `_sync_task()` in `mcp_server.py` wraps both. Separating them across tasks causes `RuntimeError: Attempted to exit cancel scope in a different task`. Same applies to test fixtures — use `@asynccontextmanager` helpers so `__aenter__`/`__aexit__` run in the same Task. The `connect_peer()` test helper in `conftest.py` handles this correctly.
 - The MCP server owns its sync protocol (~40 lines in `_sync_loop`/`_send_updates`/`_heartbeat`) using only public pycrdt APIs: `create_sync_message`, `handle_sync_message`, `create_update_message`, `doc.events()`. No Provider subclass, no private API coupling.
-- `Provider.started` event fires BEFORE sync completes — it only means the task group started. If using `Provider` directly (e.g. in tests simulating browsers), wait for actual data or use `connect_peer()` which has deterministic sync detection via SYNC_STEP2.
+- The ASGI server's Room broadcasts via `doc.events()` — one background task per room listens for Doc changes, sends `create_update_message` to all connected channels concurrently (`asyncio.gather`), and persists via `store.write()`. Room.start() waits for both DB initialization and the doc observer before returning, so serve() is safe to call immediately.
+- Rooms are cleaned up when the last client disconnects (`remove_if_empty`). Next connection to the same room restores from SQLite.
+- No `pycrdt-websocket` dependency anywhere — `pycrdt` + `pycrdt-store` only.
 - `text[start:end] = new_content` does delete+insert in a single Y.Text transaction. Prefer over separate `del` + `insert` calls.
 - `text.clear()` removes all content (equivalent to `del text[:]`).

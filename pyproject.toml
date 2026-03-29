@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
     "pycrdt>=0.12.50",
-    "pycrdt-websocket>=0.16.0",
+    "pycrdt-store>=0.1.0",
     "httpx-ws>=0.7.0",
     "starlette>=0.46.0",
     "uvicorn[standard]>=0.34.0",

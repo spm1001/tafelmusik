@@ -471,20 +471,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pycrdt-websocket"
-version = "0.16.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "anyio" },
-    { name = "pycrdt" },
-    { name = "pycrdt-store" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/4f/91/a412af8792af22e7e67a7424e7b6c64baada4897777fed885a2cb825155d/pycrdt_websocket-0.16.0.tar.gz", hash = "sha256:89d4d830f41028c55cc9877635f73f94f49131ca73ffac7353d0be421150d0fd", size = 23152, upload-time = "2025-06-11T07:15:54.298Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f4/b7/a1dd4d149fa6279f321bd7dacab66ac31e728fbae175a7d75cf8211b1f30/pycrdt_websocket-0.16.0-py3-none-any.whl", hash = "sha256:4b9ffe47c40867b7e637922680e93471fd801b6e8d6c9f6aa688fd2a17351141", size = 14568, upload-time = "2025-06-11T07:15:52.364Z" },
-]
-
-[[package]]
 name = "pydantic"
 version = "2.12.5"
 source = { registry = "https://pypi.org/simple" }
@@ -947,7 +933,7 @@ dependencies = [
     { name = "httpx-ws" },
     { name = "mcp" },
     { name = "pycrdt" },
-    { name = "pycrdt-websocket" },
+    { name = "pycrdt-store" },
     { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -964,7 +950,7 @@ requires-dist = [
     { name = "httpx-ws", specifier = ">=0.7.0" },
     { name = "mcp", specifier = ">=1.0.0" },
     { name = "pycrdt", specifier = ">=0.12.50" },
-    { name = "pycrdt-websocket", specifier = ">=0.16.0" },
+    { name = "pycrdt-store", specifier = ">=0.1.0" },
     { name = "starlette", specifier = ">=0.46.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34.0" },
 ]

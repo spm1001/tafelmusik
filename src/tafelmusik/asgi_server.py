@@ -1,15 +1,24 @@
-"""ASGI server entry point — always-running, holds Y.Doc, serves web editor."""
+"""ASGI server entry point — always-running, holds Y.Doc, serves web editor.
+
+Owns its room management directly using public pycrdt APIs (Doc, sync
+functions, SQLiteYStore). No dependency on pycrdt.websocket.
+"""
 
 import asyncio
+import logging
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from pycrdt import Doc
+from pycrdt import (
+    Doc,
+    YMessageType,
+    create_sync_message,
+    create_update_message,
+    handle_sync_message,
+)
 from pycrdt.store import SQLiteYStore
 from pycrdt.store.base import YDocNotFound
-from pycrdt.websocket import WebsocketServer
-from pycrdt.websocket.yroom import YRoom
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route, WebSocketRoute
@@ -19,20 +28,20 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 PORT = 3456
 ROOT = Path(__file__).resolve().parent.parent.parent
 
+# Uvicorn configures its own loggers but not root. basicConfig adds a
+# root handler so our lifecycle logs reach stderr (and journalctl).
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s")
+log = logging.getLogger(__name__)
 
-# --- Channel adapter: Starlette WebSocket → pycrdt Channel interface ---
+
+# --- Channel adapter: Starlette WebSocket → async message channel ---
 
 
 class StarletteWebsocket:
-    """Adapts a Starlette WebSocket to the pycrdt Channel interface."""
+    """Adapts a Starlette WebSocket to an async message channel."""
 
-    def __init__(self, websocket: WebSocket, path: str):
+    def __init__(self, websocket: WebSocket):
         self._ws = websocket
-        self._path = path
-
-    @property
-    def path(self) -> str:
-        return self._path
 
     def __aiter__(self):
         return self
@@ -67,34 +76,136 @@ async def _restore_ydoc(store_cls: type[SQLiteYStore], path: str) -> Doc:
     async with store:
         try:
             await store.apply_updates(doc)
+            log.info("Room %s: restored from store", path)
         except YDocNotFound:
-            pass  # Fresh room, no prior content
+            log.info("Room %s: created (no prior content)", path)
     return doc
 
 
-# --- WebsocketServer with SQLite persistence ---
+# --- Room management using public pycrdt APIs ---
 
 
-class TafelmusikWebsocketServer(WebsocketServer):
-    """WebsocketServer that creates rooms with SQLiteYStore persistence.
+class Room:
+    """A document room: shared Doc, connected channels, persistence.
 
-    Follows the make_ydoc pattern from pycrdt-websocket's Django consumer:
-    pre-populate a Doc from the store, then pass both the Doc and a fresh
-    store instance to YRoom.
+    Each room runs a background task that listens for Doc changes via
+    doc.events() and broadcasts updates to all connected channels while
+    persisting to SQLiteYStore. Client connections are handled by serve().
     """
 
-    def __init__(self, store_cls: type[SQLiteYStore], **kwargs):
-        super().__init__(**kwargs)
-        self._store_cls = store_cls
+    def __init__(self, name: str, doc: Doc, store: SQLiteYStore):
+        self.name = name
+        self.doc = doc
+        self.channels: set[StarletteWebsocket] = set()
+        self._store = store
+        self._task: asyncio.Task | None = None
 
-    async def get_room(self, name: str) -> YRoom:
+    async def start(self) -> None:
+        """Start the broadcast + persistence loop.
+
+        Blocks until the doc observer is active and the store is ready,
+        so serve() can safely be called immediately after start() returns.
+        """
+        ready = asyncio.Event()
+        self._task = asyncio.create_task(self._run(ready))
+        await ready.wait()
+
+    async def stop(self) -> None:
+        """Stop the room and close the store."""
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _run(self, ready: asyncio.Event) -> None:
+        """Run the store and broadcast loop.
+
+        The store must be running (async with) before we can call write().
+        The doc.events() subscription must be active before any client can
+        modify the doc, otherwise we'd miss events. The ready event signals
+        both are established — including DB initialization completing.
+        """
+        async with self._store:
+            await self._store.db_initialized.wait()
+            async with self.doc.events() as events:
+                ready.set()
+                async for event in events:
+                    update_msg = create_update_message(event.update)
+                    # Broadcast concurrently — a slow client shouldn't
+                    # block updates to everyone else in the room.
+                    channels = list(self.channels)
+                    if channels:
+                        await asyncio.gather(*(self._safe_send(ch, update_msg) for ch in channels))
+                    try:
+                        await self._store.write(event.update)
+                    except Exception:
+                        log.warning(
+                            "Failed to persist update for room %s",
+                            self.name,
+                            exc_info=True,
+                        )
+
+    async def _safe_send(self, channel: StarletteWebsocket, message: bytes) -> None:
+        """Send to a channel, removing it on failure."""
+        try:
+            await channel.send(message)
+        except Exception:
+            self.channels.discard(channel)
+
+    async def serve(self, channel: StarletteWebsocket) -> None:
+        """Handle a single WebSocket client.
+
+        Sends SYNC_STEP1 to initiate the handshake, then processes incoming
+        sync messages. Doc changes from handle_sync_message trigger the
+        broadcast loop (via doc.events()), which sends updates to all
+        channels including this one. Yjs deduplicates on the client side.
+        """
+        self.channels.add(channel)
+        log.info("Room %s: client connected (%d total)", self.name, len(self.channels))
+        try:
+            await channel.send(create_sync_message(self.doc))
+            async for message in channel:
+                if message[0] == YMessageType.SYNC:
+                    reply = handle_sync_message(message[1:], self.doc)
+                    if reply is not None:
+                        await channel.send(reply)
+        finally:
+            self.channels.discard(channel)
+            log.info("Room %s: client disconnected (%d remaining)", self.name, len(self.channels))
+
+
+class RoomManager:
+    """Manages document rooms with lazy creation and persistence restore."""
+
+    def __init__(self, store_cls: type[SQLiteYStore]):
+        self._store_cls = store_cls
+        self.rooms: dict[str, Room] = {}
+
+    async def get_room(self, name: str) -> Room:
+        """Get or create a room, restoring any persisted state."""
         if name not in self.rooms:
             doc = await _restore_ydoc(self._store_cls, name)
             store = self._store_cls(path=name)
-            self.rooms[name] = YRoom(ydoc=doc, ystore=store, log=self.log)
-        room = self.rooms[name]
-        await self.start_room(room)
-        return room
+            room = Room(name, doc, store)
+            await room.start()
+            self.rooms[name] = room
+        return self.rooms[name]
+
+    async def remove_if_empty(self, name: str) -> None:
+        """Stop and remove a room if no clients are connected."""
+        room = self.rooms.get(name)
+        if room and not room.channels:
+            del self.rooms[name]
+            await room.stop()
+            log.info("Room %s: cleaned up (no clients)", name)
+
+    async def close(self) -> None:
+        """Stop all rooms."""
+        for room in self.rooms.values():
+            await room.stop()
+        self.rooms.clear()
 
 
 # --- App factory ---
@@ -116,13 +227,15 @@ def create_app(
         },
     )
 
-    ws_server = TafelmusikWebsocketServer(store_cls=Store)
+    manager = RoomManager(store_cls=Store)
 
     async def websocket_endpoint(websocket: WebSocket):
-        room = websocket.path_params.get("room", "default")
+        room_name = websocket.path_params.get("room", "default")
         await websocket.accept()
-        channel = StarletteWebsocket(websocket, room)
-        await ws_server.serve(channel)
+        channel = StarletteWebsocket(websocket)
+        room = await manager.get_room(room_name)
+        await room.serve(channel)
+        await manager.remove_if_empty(room_name)
 
     def _query_persisted_rooms() -> set[str]:
         """Query SQLite for room names (runs in a thread to avoid blocking)."""
@@ -134,15 +247,17 @@ def create_app(
 
     async def list_rooms(request):
         """Return room names from both in-memory rooms and SQLite store."""
-        memory_rooms = set(ws_server.rooms.keys())
+        memory_rooms = set(manager.rooms.keys())
         persisted_rooms = await asyncio.to_thread(_query_persisted_rooms)
         all_rooms = sorted(memory_rooms | persisted_rooms)
         return JSONResponse({"rooms": all_rooms})
 
     @asynccontextmanager
     async def lifespan(app):
-        async with ws_server:
+        try:
             yield
+        finally:
+            await manager.close()
 
     return Starlette(
         lifespan=lifespan,
