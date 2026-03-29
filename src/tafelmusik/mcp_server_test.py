@@ -216,6 +216,24 @@ async def test_sync_timeout(tmp_path):
         task.cancel()
 
 
+async def test_connect_fails_fast_when_server_down():
+    """AppState.connect raises ConnectionError quickly when server is unreachable."""
+    import time
+
+    async with httpx.AsyncClient() as client:
+        state = AppState(
+            client=client,
+            server_url="ws://127.0.0.1:1",  # nothing listening
+            sync_timeout=10.0,  # should NOT wait this long
+        )
+        start = time.monotonic()
+        with pytest.raises(ConnectionError, match="Connection to room"):
+            await state.connect("unreachable-room")
+        elapsed = time.monotonic() - start
+        assert elapsed < 5.0, f"Should fail fast, took {elapsed:.1f}s"
+        assert "unreachable-room" not in state.rooms
+
+
 async def test_reconnect_after_server_restart(tmp_path):
     """MCP AppState reconnects transparently after the ASGI server restarts."""
     db_path = tmp_path / "reconnect.db"

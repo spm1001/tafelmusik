@@ -58,7 +58,7 @@ cd public && npx esbuild cm-entry.js --bundle --outfile=editor.js --minify  # Re
 - `observe()` callbacks are synchronous — use `asyncio.Queue.put_nowait()` + async consumer.
 - Python MCP SDK: custom notifications require low-level `Server` API, not FastMCP.
 - `Provider.started` event fires BEFORE sync completes — it only means the task group started. Use `SyncAwareProvider` (in `mcp_server.py`) which intercepts SYNC_STEP2 and exposes a deterministic `synced` event.
-- Base `Provider._run()` exits on disconnect but `_send_updates()` stays alive, so the provider task never completes. `SyncAwareProvider` cancels the task group scope when `_run()` exits, enabling dead connection detection via `_task.done()`.
-- `aconnect_ws` uses anyio cancel scopes that are task-bound. Don't manage `aconnect_ws` in a pytest fixture — use `@asynccontextmanager` helpers so `__aenter__`/`__aexit__` run in the same asyncio Task.
+- Base `Provider._run()` exits on disconnect but `_send_updates()` stays alive, so the provider task never completes. `SyncAwareProvider` cancels the task group scope when `_run()` exits, enabling dead connection detection via the `dead` Event.
+- `aconnect_ws` uses anyio cancel scopes that are task-bound. The WebSocket and Provider must run in the SAME asyncio Task — `_provider_task()` in `mcp_server.py` wraps both. Separating them across tasks (e.g., opening the WebSocket in a tool handler and running the Provider via `asyncio.create_task()`) causes `RuntimeError: Attempted to exit cancel scope in a different task`. Same applies to test fixtures — use `@asynccontextmanager` helpers so `__aenter__`/`__aexit__` run in the same Task.
 - `text[start:end] = new_content` does delete+insert in a single Y.Text transaction. Prefer over separate `del` + `insert` calls.
 - `text.clear()` removes all content (equivalent to `del text[:]`).

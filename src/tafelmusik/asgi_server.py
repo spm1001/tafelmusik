@@ -46,8 +46,15 @@ class StarletteWebsocket:
     async def send(self, message: bytes) -> None:
         try:
             await self._ws.send_bytes(message)
-        except WebSocketDisconnect:
-            pass  # Connection closed — receive loop will detect via StopAsyncIteration
+        except (WebSocketDisconnect, RuntimeError):
+            # WebSocketDisconnect: first send after client disconnects.
+            # RuntimeError: subsequent sends — Starlette's state machine
+            # transitions to DISCONNECTED after the first failure, then
+            # raises RuntimeError("Cannot call 'send' once a close message
+            # has been sent") on any further send attempt.
+            # Both are safe to suppress — the receive loop detects the
+            # dead connection via StopAsyncIteration on the next read.
+            pass
 
 
 # --- Persistence: restore Y.Doc from SQLiteYStore ---

@@ -42,6 +42,11 @@ from tafelmusik import document
 log = logging.getLogger(__name__)
 
 
+def _ws_to_http(url: str) -> str:
+    """Convert ws:// or wss:// URL to http:// or https:// for httpx."""
+    return url.replace("ws://", "http://").replace("wss://", "https://")
+
+
 # --- Sync-aware Provider ---
 
 
@@ -53,9 +58,9 @@ class SyncAwareProvider(Provider):
     the server's full state — and sets `synced` immediately after applying it.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, synced: Event | None = None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.synced = Event()
+        self.synced = synced or Event()
 
     async def _run(self):
         sync_message = create_sync_message(self._doc)
@@ -72,8 +77,8 @@ class SyncAwareProvider(Provider):
                     self.synced.set()
         # Channel iterator ended — connection lost. Cancel the task group
         # so _send_updates stops and the provider task completes. Without
-        # this, _send_updates hangs forever waiting for local events, and
-        # the dead connection is never detected via the `dead` event.
+        # this, _send_updates hangs forever waiting for local events,
+        # provider.start() never returns, and the dead event never fires.
         if self._task_group is not None:
             self._task_group.cancel_scope.cancel()
 
@@ -136,7 +141,7 @@ class AppState:
             del self.rooms[room]
 
         # httpx-ws uses http:// for the WebSocket upgrade
-        http_url = self.server_url.replace("ws://", "http://").replace("wss://", "https://")
+        http_url = _ws_to_http(self.server_url)
 
         doc = Doc()
         doc["content"] = text = Text()
@@ -153,23 +158,44 @@ class AppState:
             try:
                 async with aconnect_ws(f"{http_url}/{room}", self.client) as ws:
                     channel = HttpxWebsocket(ws, room)
-                    provider = SyncAwareProvider(doc, channel)
-                    provider.synced = synced
+                    provider = SyncAwareProvider(doc, channel, synced=synced)
                     await provider.start()
             except Exception:
-                pass
+                log.warning("Provider task for room %s failed", room, exc_info=True)
             finally:
                 dead.set()
 
         task = asyncio.create_task(_provider_task())
+
+        # Race synced against dead — if the connection fails before sync
+        # completes, dead fires first and we fail fast instead of waiting
+        # the full sync_timeout.
+        synced_task = asyncio.ensure_future(synced.wait())
+        dead_task = asyncio.ensure_future(dead.wait())
         try:
-            await asyncio.wait_for(synced.wait(), timeout=self.sync_timeout)
-        except TimeoutError:
+            done, _ = await asyncio.wait(
+                [synced_task, dead_task],
+                timeout=self.sync_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            synced_task.cancel()
+            dead_task.cancel()
+
+        if not synced.is_set():
+            # Check dead BEFORE cancelling — cancellation always sets dead
+            # via the finally block, so checking after would always be True.
+            failed_fast = dead.is_set()
             task.cancel()
             try:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+            if failed_fast:
+                raise ConnectionError(
+                    f"Connection to room '{room}' failed. "
+                    f"Is the Tafelmusik server running on {self.server_url}?"
+                )
             raise TimeoutError(
                 f"Sync with Tafelmusik server timed out after {self.sync_timeout}s "
                 f"for room '{room}'. Is the server running and responding?"
@@ -283,7 +309,7 @@ async def list_docs(ctx: Context) -> str:
     Returns room names from both active connections and persisted storage.
     """
     state = _get_state(ctx)
-    http_url = state.server_url.replace("ws://", "http://").replace("wss://", "https://")
+    http_url = _ws_to_http(state.server_url)
     try:
         response = await state.client.get(f"{http_url}/api/rooms")
         response.raise_for_status()
