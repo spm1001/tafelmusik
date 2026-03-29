@@ -40,7 +40,7 @@ cd public && npx esbuild cm-entry.js --bundle --outfile=editor.js --minify  # Re
 ## Key Conventions
 
 - **Port:** 3456 (ASGI server). MCP/channel servers discover via `TAFELMUSIK_URL` env var.
-- **Persistence:** SQLiteYStore. Subclass with `db_path = "data/tafelmusik.db"`.
+- **Persistence:** SQLiteYStore stores updates (not documents). Squashes after 60s idle. See `.bon/understanding.md` for the full mental model.
 - **Version:** Single source in `.claude-plugin/plugin.json`.
 - **Tests:** Adjacent to source (`*_test.py`). pytest + pytest-asyncio.
 - **Comments:** Point + quote architecture. Single StickyIndex anchor + stored quote text. Re-anchor by text search after replace_section.
@@ -50,6 +50,10 @@ cd public && npx esbuild cm-entry.js --bundle --outfile=editor.js --minify  # Re
 - `WebsocketServer.start()` blocks forever — run as `asyncio.create_task()`, never `await` directly.
 - `get_room()` is a coroutine — must be awaited.
 - `HttpxWebsocket(ws, room_name)` wraps an existing httpx-ws connection, not a URL.
+- Import path is `from pycrdt.websocket import ...` NOT `from pycrdt_websocket import ...` (merged namespace in 0.16.0).
+- `SQLiteYStore` is in `from pycrdt.store import SQLiteYStore`, NOT `pycrdt.websocket`.
+- YRoom does NOT auto-restore from ystore on startup. Use the two-instance pattern: transient store reads via `apply_updates()`, fresh store passed to YRoom for writes. See `_restore_ydoc()` in `asgi_server.py`.
+- `SQLiteYStore.db_path` is a class variable. To set it dynamically, use `type("Store", (SQLiteYStore,), {"db_path": path})` — class bodies can't see enclosing function locals.
 - `StickyIndex.new(text, idx, Assoc.AFTER)` — constructor `StickyIndex(text, idx)` doesn't work.
 - `observe()` callbacks are synchronous — use `asyncio.Queue.put_nowait()` + async consumer.
 - Python MCP SDK: custom notifications require low-level `Server` API, not FastMCP.
