@@ -245,7 +245,7 @@ async def test_replace_section_via_mcp(server):
         conn.text += "# Doc\n\nIntro\n\n## API\n\nOld API text\n\n## Usage\n\nUsage text\n"
         await asyncio.sleep(0.3)
 
-        document.replace_section(conn.text, "## API\n\nNew API documentation\n")
+        document.replace_section(conn.text, "## API\n\nNew API documentation\n", author="test")
         content = str(conn.text)
         assert "New API documentation" in content
         assert "Old API text" not in content
@@ -261,7 +261,7 @@ async def test_replace_all_via_mcp(server):
         conn.text += "Old content that should be gone"
         await asyncio.sleep(0.3)
 
-        document.replace_all(conn.text, "# Fresh Start\n\nCompletely new.\n")
+        document.replace_all(conn.text, "# Fresh Start\n\nCompletely new.\n", author="test")
         content = str(conn.text)
         assert "Fresh Start" in content
         assert "Old content" not in content

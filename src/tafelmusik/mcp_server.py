@@ -353,13 +353,13 @@ async def edit_doc(room: str, content: str, mode: str, ctx: Context) -> str:
     conn = await state.connect(room)
 
     if mode == "append":
-        conn.text += content
+        conn.text.insert(len(str(conn.text)), content, attrs={"author": "claude"})
         return f"Appended {len(content)} chars to '{room}'"
     elif mode == "replace_all":
-        document.replace_all(conn.text, content)
+        document.replace_all(conn.text, content, author="claude")
         return f"Replaced all content in '{room}' ({len(content)} chars)"
     elif mode == "replace_section":
-        replaced = document.replace_section(conn.text, content)
+        replaced = document.replace_section(conn.text, content, author="claude")
         heading = content.split("\n", 1)[0].strip()
         verb = "Replaced existing" if replaced else "Appended new"
         return f"{verb} section '{heading}' in '{room}'"
@@ -380,7 +380,7 @@ async def load_doc(room: str, markdown: str, ctx: Context) -> str:
     """
     state = _get_state(ctx)
     conn = await state.connect(room)
-    document.replace_all(conn.text, markdown)
+    document.replace_all(conn.text, markdown, author="claude")
     return f"Loaded {len(markdown)} chars into '{room}'"
 
 

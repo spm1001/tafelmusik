@@ -46,12 +46,14 @@ def read(text: Text) -> str:
     return str(text)
 
 
-def replace_all(text: Text, content: str) -> None:
-    """Replace all content. Uses slice assignment for a single CRDT transaction."""
-    text[:] = content
+def replace_all(text: Text, content: str, *, author: str) -> None:
+    """Replace all content, tagged with authorship."""
+    del text[:]
+    if content:
+        text.insert(0, content, attrs={"author": author})
 
 
-def replace_section(text: Text, new_content: str) -> bool:
+def replace_section(text: Text, new_content: str, *, author: str) -> bool:
     """Replace a markdown section identified by its heading, or append if not found.
 
     new_content must start with a markdown heading line (e.g. "## Design\\n...").
@@ -72,11 +74,13 @@ def replace_section(text: Text, new_content: str) -> bool:
             separator = ""
         else:
             separator = ""
-        text += separator + new_content
+        insert_at = len(str(text))
+        text.insert(insert_at, separator + new_content, attrs={"author": author})
         return False
 
     start, end = bounds
-    text[start:end] = new_content
+    del text[start:end]
+    text.insert(start, new_content, attrs={"author": author})
     return True
 
 
