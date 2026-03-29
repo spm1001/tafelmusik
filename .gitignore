@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+
+# JS (node_modules in public/ for esbuild — editor.js bundle is committed)
+public/node_modules/
+
+# Data
+data/uploads/*
+!data/uploads/.gitkeep
+*.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

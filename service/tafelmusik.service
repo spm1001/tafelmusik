@@ -1,0 +1,23 @@
+# Tafelmusik ASGI server — systemd user unit
+# Install: cp service/tafelmusik.service ~/.config/systemd/user/
+#          systemctl --user daemon-reload
+#          systemctl --user enable --now tafelmusik
+[Unit]
+Description=Tafelmusik collaborative editing server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Repos/batterie/tafelmusik
+ExecStartPre=/bin/bash -c 'lsof -ti :3456 | xargs -r kill 2>/dev/null || true'
+ExecStart=%h/.local/bin/uv run python -m tafelmusik.asgi_server
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+Environment=TAFELMUSIK_PORT=3456
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tafelmusik
+
+[Install]
+WantedBy=default.target
