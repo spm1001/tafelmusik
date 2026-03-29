@@ -7,6 +7,11 @@ local Doc; the Provider handles bidirectional sync automatically.
 
 Lifecycle: httpx client created at startup (lifespan), room connections
 created lazily on first tool call, all cleaned up when the MCP process exits.
+
+Important: aconnect_ws (httpx-ws) uses anyio cancel scopes that are bound to
+the asyncio Task that entered them. The Provider must run in the SAME task
+that opens the WebSocket. This is why _provider_task() wraps both aconnect_ws
+and provider.start() — separating them across tasks causes cancel scope errors.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 import httpx
@@ -46,11 +51,6 @@ class SyncAwareProvider(Provider):
     The base Provider's `started` event fires before SYNC_STEP1 is even sent.
     This subclass intercepts the SYNC_STEP2 response — the message that delivers
     the server's full state — and sets `synced` immediately after applying it.
-
-    Usage:
-        provider = SyncAwareProvider(doc, channel)
-        task = asyncio.create_task(provider.start())
-        await provider.synced.wait()  # doc now has full server state
     """
 
     def __init__(self, *args, **kwargs):
@@ -73,7 +73,7 @@ class SyncAwareProvider(Provider):
         # Channel iterator ended — connection lost. Cancel the task group
         # so _send_updates stops and the provider task completes. Without
         # this, _send_updates hangs forever waiting for local events, and
-        # the dead connection is never detected by _task.done().
+        # the dead connection is never detected via the `dead` event.
         if self._task_group is not None:
             self._task_group.cancel_scope.cancel()
 
@@ -85,34 +85,25 @@ class SyncAwareProvider(Provider):
 class RoomConnection:
     """A live connection to a single room on the ASGI server.
 
-    Holds the local Doc (with a Y.Text keyed "content"), a Provider
-    that syncs it over WebSocket, and the AsyncExitStack that owns
-    the WebSocket's lifetime.
+    Holds the local Doc (with a Y.Text keyed "content") and events for
+    sync status and liveness. The Provider runs in a background task that
+    also owns the WebSocket — they share the same asyncio Task to avoid
+    anyio cancel scope cross-task violations.
     """
 
     doc: Doc
     text: Text
-    provider: Provider
+    synced: Event
+    dead: Event
     _task: asyncio.Task
-    _exit_stack: AsyncExitStack
 
     async def close(self) -> None:
-        # Stop the Provider first (cancels its internal task group)
-        try:
-            await self.provider.stop()
-        except Exception:
-            pass  # Provider may already be stopped if connection was lost
-        # Wait for the Provider task to fully complete before closing the WebSocket
         if not self._task.done():
             self._task.cancel()
         try:
             await self._task
         except (asyncio.CancelledError, Exception):
             pass
-        try:
-            await self._exit_stack.aclose()
-        except RuntimeError:
-            pass  # Dead connection — aconnect_ws cleanup may fail on cancel scopes
 
 
 @dataclass
@@ -127,6 +118,7 @@ class AppState:
     client: httpx.AsyncClient
     server_url: str
     rooms: dict[str, RoomConnection] = field(default_factory=dict)
+    sync_timeout: float = 10.0
 
     async def connect(self, room: str) -> RoomConnection:
         """Get or create a connection to a room.
@@ -136,7 +128,7 @@ class AppState:
         """
         if room in self.rooms:
             conn = self.rooms[room]
-            if not conn._task.done():
+            if not conn.dead.is_set():
                 return conn
             # Connection died — clean up before reconnecting
             log.info("Room %s connection lost, reconnecting", room)
@@ -146,21 +138,45 @@ class AppState:
         # httpx-ws uses http:// for the WebSocket upgrade
         http_url = self.server_url.replace("ws://", "http://").replace("wss://", "https://")
 
-        stack = AsyncExitStack()
-        ws = await stack.enter_async_context(
-            aconnect_ws(f"{http_url}/{room}", self.client)
-        )
-
-        channel = HttpxWebsocket(ws, room)
         doc = Doc()
         doc["content"] = text = Text()
-        provider = SyncAwareProvider(doc, channel)
-        task = asyncio.create_task(provider.start())
-        await provider.synced.wait()  # deterministic — fires after SYNC_STEP2 applied
+        synced = Event()
+        dead = Event()
+
+        async def _provider_task():
+            """Run WebSocket + Provider in the same asyncio Task.
+
+            aconnect_ws cancel scopes are task-bound — entering the WebSocket
+            in one task and running the Provider in another causes RuntimeError.
+            This function keeps both in the same task.
+            """
+            try:
+                async with aconnect_ws(f"{http_url}/{room}", self.client) as ws:
+                    channel = HttpxWebsocket(ws, room)
+                    provider = SyncAwareProvider(doc, channel)
+                    provider.synced = synced
+                    await provider.start()
+            except Exception:
+                pass
+            finally:
+                dead.set()
+
+        task = asyncio.create_task(_provider_task())
+        try:
+            await asyncio.wait_for(synced.wait(), timeout=self.sync_timeout)
+        except TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise TimeoutError(
+                f"Sync with Tafelmusik server timed out after {self.sync_timeout}s "
+                f"for room '{room}'. Is the server running and responding?"
+            )
 
         conn = RoomConnection(
-            doc=doc, text=text, provider=provider,
-            _task=task, _exit_stack=stack,
+            doc=doc, text=text, synced=synced, dead=dead, _task=task,
         )
         self.rooms[room] = conn
         return conn

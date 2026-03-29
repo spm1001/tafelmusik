@@ -18,5 +18,8 @@ data/uploads/*
 .vscode/
 *.swp
 
+# MCP (machine-specific server URLs)
+.mcp.json
+
 # OS
 .DS_Store

@@ -177,6 +177,45 @@ async def test_list_rooms_endpoint(server):
             await provider.stop()
 
 
+async def test_sync_timeout(tmp_path):
+    """AppState.connect raises TimeoutError if server never sends SYNC_STEP2."""
+    from starlette.applications import Starlette
+    from starlette.routing import WebSocketRoute
+    from starlette.websockets import WebSocket as StarletteWS
+
+    async def silent_ws(websocket: StarletteWS):
+        await websocket.accept()
+        # Accept connection but never respond to sync protocol
+        try:
+            while True:
+                await websocket.receive_bytes()
+        except Exception:
+            pass
+
+    app = Starlette(routes=[WebSocketRoute("/{room:path}", silent_ws)])
+    port = get_free_port()
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    srv = uvicorn.Server(config)
+    task = asyncio.create_task(srv.serve())
+    await asyncio.sleep(1)
+
+    try:
+        async with httpx.AsyncClient() as client:
+            state = AppState(
+                client=client,
+                server_url=f"ws://127.0.0.1:{port}",
+                sync_timeout=1.0,
+            )
+            with pytest.raises(TimeoutError, match="timed out"):
+                await state.connect("test-room")
+            # Connection should be cleaned up — no leaked rooms
+            assert "test-room" not in state.rooms
+    finally:
+        srv.should_exit = True
+        await asyncio.sleep(0.5)
+        task.cancel()
+
+
 async def test_reconnect_after_server_restart(tmp_path):
     """MCP AppState reconnects transparently after the ASGI server restarts."""
     db_path = tmp_path / "reconnect.db"

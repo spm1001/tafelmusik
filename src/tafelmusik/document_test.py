@@ -153,3 +153,30 @@ def test_replace_section_content_without_trailing_newline():
     # Should still work even without trailing newline
     assert "New content" in result
     assert "## B" in result
+
+
+def test_replace_section_append_doc_no_trailing_newline():
+    """Appending to a doc that doesn't end with a newline adds separator."""
+    text = _make_text("# Title\n\nIntro")  # no trailing newline
+    replaced = document.replace_section(text, "## New\n\nContent\n")
+    assert replaced is False
+    result = str(text)
+    assert "\n\n## New" in result
+
+
+def test_replace_section_append_doc_single_trailing_newline():
+    """Appending to a doc ending with one newline adds one more."""
+    text = _make_text("# Title\n\nIntro\n")  # single trailing newline
+    replaced = document.replace_section(text, "## New\n\nContent\n")
+    assert replaced is False
+    result = str(text)
+    assert "Intro\n\n## New" in result
+
+
+def test_replace_section_append_doc_double_trailing_newline():
+    """Appending to a doc already ending with \\n\\n adds no extra whitespace."""
+    text = _make_text("# Title\n\nIntro\n\n")  # already double newline
+    replaced = document.replace_section(text, "## New\n\nContent\n")
+    assert replaced is False
+    result = str(text)
+    assert "Intro\n\n## New" in result

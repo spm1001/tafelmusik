@@ -44,7 +44,10 @@ class StarletteWebsocket:
             raise StopAsyncIteration()
 
     async def send(self, message: bytes) -> None:
-        await self._ws.send_bytes(message)
+        try:
+            await self._ws.send_bytes(message)
+        except WebSocketDisconnect:
+            pass  # Connection closed — receive loop will detect via StopAsyncIteration
 
 
 # --- Persistence: restore Y.Doc from SQLiteYStore ---

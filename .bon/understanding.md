@@ -20,6 +20,20 @@ If you find yourself wanting to "just read the SQLite directly" or "bypass the s
 
 For deep understanding of how the CRDT actually works — update encoding, state vectors, the sync protocol, why replaying updates in any order converges — read https://github.com/yjs/yjs/blob/main/INTERNALS.md. This matters most for Unit 3 (channel server), where we need to interpret Y.Text updates to produce semantic change summaries.
 
+## MCP server connection lifecycle
+
+The MCP server's connection lifecycle has a specific pattern: httpx client at the top (created in lifespan, shared across rooms), per-room WebSocket connections managed by AsyncExitStack (created lazily on first tool call), and pycrdt Provider tasks syncing each room's Doc. The Y.Text key is "content" everywhere — browser, MCP server, tests — consistency here is load-bearing for sync.
+
+The base Provider has a subtle liveness bug: when the server disconnects, `_run()` exits (channel iterator stops) but `_send_updates()` stays alive forever waiting for local Doc events. The task group never finishes, so the provider task never completes, and dead connections go undetected. SyncAwareProvider fixes both this (cancels the task group when `_run()` exits) and the sync detection problem (intercepts SYNC_STEP2, the message that delivers the server's full state, and exposes a deterministic `synced` event — no sleep heuristic needed).
+
 ## Working with niche libraries
 
 pycrdt-websocket is a framework where the persistence docs lag the capabilities. The API surface is small but the extension points aren't where you'd expect. When you can't find a documented way to do something (like restoring state on startup), check ALL the framework's consumer implementations — the Django Channels consumer has `make_ydoc()` which embodies the pattern the raw ASGI server lacks documentation for. The lesson generalises: niche libraries often have the pattern you need, just in a different consumer/adapter than the one you're using. Reading one adapter's source is cheaper than inventing your own approach.
+
+## Async testing landmines
+
+The anyio/asyncio boundary is real: aconnect_ws (httpx-ws) uses anyio cancel scopes that are bound to the asyncio Task that entered them. This means test fixtures (which may teardown in a different task) can't manage WebSocket lifetimes — use @asynccontextmanager helpers instead. This is a Python 3.14 + anyio interaction, not a pycrdt-specific issue.
+
+## Document operations
+
+replace_section finds headings by exact text match, not by position. This matters because in a CRDT, positions shift as peers edit concurrently. Text matching is stable; index-based matching isn't. The section boundary algorithm (same-or-higher heading level) matches CommonMark's implicit section structure.
