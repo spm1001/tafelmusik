@@ -123,10 +123,8 @@ def create_app(
     def _query_persisted_rooms() -> set[str]:
         """Query SQLite for room names (runs in a thread to avoid blocking)."""
         try:
-            conn = sqlite3.connect(_db_path)
-            rooms = {row[0] for row in conn.execute("SELECT DISTINCT path FROM yupdates")}
-            conn.close()
-            return rooms
+            with sqlite3.connect(_db_path) as conn:
+                return {row[0] for row in conn.execute("SELECT DISTINCT path FROM yupdates")}
         except Exception:
             return set()  # DB may not exist yet
 

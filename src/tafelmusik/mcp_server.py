@@ -48,6 +48,19 @@ def _ws_to_http(url: str) -> str:
 
 
 # --- Sync-aware Provider ---
+#
+# SyncAwareProvider overrides Provider._run() and calls Provider._send_updates().
+# Both are private APIs — Provider's public surface is just start() and stop().
+# We also access _doc, _channel, and _task_group (set by Provider.__init__).
+# Validated against pycrdt 0.12.50. If upgrading pycrdt, re-run tests.
+
+_PROVIDER_PRIVATE_ATTRS = ("_doc", "_channel", "_task_group", "_send_updates", "_run")
+for _attr in _PROVIDER_PRIVATE_ATTRS:
+    if not hasattr(Provider, _attr) and _attr in ("_send_updates", "_run"):
+        raise ImportError(
+            f"Provider.{_attr} not found — pycrdt API may have changed. "
+            f"SyncAwareProvider was validated against pycrdt 0.12.50."
+        )
 
 
 class SyncAwareProvider(Provider):

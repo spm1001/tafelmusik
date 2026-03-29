@@ -119,6 +119,59 @@ async def test_http_serves_index(server):
         assert "<html>" in r.text
 
 
+async def test_server_survives_send_after_disconnect(server):
+    """Server handles send to a disconnected client without crashing.
+
+    Starlette's WebSocket state machine raises WebSocketDisconnect on the
+    first failed send, then RuntimeError on subsequent sends. Both must be
+    caught in StarletteWebsocket.send() to prevent crashing the entire
+    WebsocketServer via pycrdt's task group.
+    """
+    port = server
+
+    # Client 1: connect, write content, then disconnect abruptly
+    doc1 = Doc()
+    doc1["content"] = t1 = Text()
+    async with httpx.AsyncClient() as client:
+        async with aconnect_ws(f"http://127.0.0.1:{port}/send-crash-test", client) as ws:
+            ch = HttpxWebsocket(ws, "send-crash-test")
+            p = Provider(doc1, ch)
+            asyncio.create_task(p.start())
+            await asyncio.sleep(0.5)
+            t1 += "Content from client 1"
+            await asyncio.sleep(0.5)
+            await p.stop()
+    # WebSocket closed — server may still try to send to this dead channel
+
+    await asyncio.sleep(0.5)
+
+    # Client 2: connect to the SAME room — proves server is still alive
+    doc2 = Doc()
+    doc2["content"] = t2 = Text()
+    async with httpx.AsyncClient() as client:
+        async with aconnect_ws(f"http://127.0.0.1:{port}/send-crash-test", client) as ws:
+            ch = HttpxWebsocket(ws, "send-crash-test")
+            p = Provider(doc2, ch)
+            asyncio.create_task(p.start())
+            await asyncio.sleep(0.5)
+            assert "Content from client 1" in str(t2)
+            await p.stop()
+
+    # Client 3: connect to a DIFFERENT room — proves entire server is healthy
+    doc3 = Doc()
+    doc3["content"] = t3 = Text()
+    async with httpx.AsyncClient() as client:
+        async with aconnect_ws(f"http://127.0.0.1:{port}/unrelated-room", client) as ws:
+            ch = HttpxWebsocket(ws, "unrelated-room")
+            p = Provider(doc3, ch)
+            asyncio.create_task(p.start())
+            await asyncio.sleep(0.5)
+            t3 += "Still alive"
+            await asyncio.sleep(0.3)
+            assert "Still alive" in str(t3)
+            await p.stop()
+
+
 async def test_persistence_across_restart(tmp_path):
     """Content written to one server instance is restored by a fresh instance."""
     db_path = tmp_path / "persist.db"
