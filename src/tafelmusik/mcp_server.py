@@ -739,5 +739,38 @@ async def list_comments(room: str, ctx: Context) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def resolve_comment(room: str, quote: str, ctx: Context) -> str:
+    """Resolve (dismiss) a comment by its quoted text.
+
+    Marks the comment as resolved. It disappears from the browser's
+    comments pane and its yellow underline is removed.
+
+    Args:
+        room: Document room name
+        quote: The quoted text of the comment to resolve (from list_comments)
+    """
+    state = _get_state(ctx)
+    conn = await state.connect(room)
+
+    comments_map: Map = conn.doc.get("comments", type=Map)
+
+    resolved_count = 0
+    for comment_id in comments_map:
+        comment = comments_map[comment_id]
+        if not isinstance(comment, Map):
+            continue
+        if comment.get("resolved"):
+            continue
+        if comment.get("quote", "").strip() == quote.strip():
+            with conn.doc.transaction(origin=authors.CLAUDE):
+                comment["resolved"] = True
+            resolved_count += 1
+
+    if resolved_count == 0:
+        return f"No active comment found with quote: {quote!r}"
+    return f"Resolved {resolved_count} comment(s) on '{room}' matching {quote!r}"
+
+
 if __name__ == "__main__":
     mcp.run()
