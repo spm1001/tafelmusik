@@ -53,6 +53,7 @@ function init() {
   let mode = "document";
   let view = null;
   let commentRanges = [];
+  let orphanedComments = [];
   let activeCommentId = null;
   let capturedSelection = null; // {from, to, text} — set in "commenting" mode
 
@@ -78,6 +79,7 @@ function init() {
 
   function resolveRanges() {
     const ranges = [];
+    const orphans = [];
     const docText = view ? view.state.doc.toString() : "";
 
     comments.forEach((comment, id) => {
@@ -86,6 +88,11 @@ function init() {
 
       const quote = comment.get("quote");
       if (!quote) return;
+
+      if (comment.get("orphaned")) {
+        orphans.push({id, quote, body: comment.get("body"), author: comment.get("author"), created: comment.get("created") || ""});
+        return;
+      }
 
       try {
         let from = -1, to = -1;
@@ -134,6 +141,7 @@ function init() {
       return a.from - b.from;
     });
     commentRanges = ranges;
+    orphanedComments = orphans;
   }
 
   // --- Comment decorations ---
@@ -211,7 +219,7 @@ function init() {
 
   const composeHint = document.createElement("div");
   composeHint.className = "compose-hint";
-  composeHint.textContent = "\u2318\u21A9 to comment \u00B7 Esc to cancel";
+  composeHint.textContent = "\u2318\u21A9 or Shift\u21A9 to comment \u00B7 Esc to cancel";
 
   composeCard.append(composeQuoteEl, composeEditorWrap, composeHint);
 
@@ -252,6 +260,7 @@ function init() {
     extensions: [
       keymap.of([
         {key: "Mod-Enter", run: () => submitComment()},
+        {key: "Shift-Enter", run: () => submitComment()},
         {key: "Escape", run: () => cancelCompose()},
       ]),
       minimalSetup,
@@ -342,6 +351,36 @@ function init() {
         }
       });
 
+      commentsList.appendChild(card);
+    }
+
+    // Orphaned comments — greyed out at the bottom
+    for (const orphan of orphanedComments) {
+      const card = document.createElement("div");
+      card.className = "comment-card orphaned";
+
+      const author = document.createElement("div");
+      author.className = "comment-author";
+      author.textContent = orphan.author + " \u00B7 orphaned";
+
+      const quote = document.createElement("div");
+      quote.className = "comment-quote";
+      quote.textContent = orphan.quote;
+
+      const body = document.createElement("div");
+      body.className = "comment-body";
+      body.textContent = orphan.body;
+
+      const resolve = document.createElement("button");
+      resolve.className = "comment-resolve";
+      resolve.textContent = "Resolve";
+      resolve.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const comment = comments.get(orphan.id);
+        if (comment) comment.set("resolved", true);
+      });
+
+      card.append(author, quote, body, resolve);
       commentsList.appendChild(card);
     }
 

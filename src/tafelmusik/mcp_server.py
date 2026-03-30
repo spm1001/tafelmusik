@@ -45,7 +45,7 @@ from pycrdt import (
     handle_sync_message,
 )
 
-from tafelmusik import authors, document
+from tafelmusik import authors, comments, document
 
 log = logging.getLogger(__name__)
 
@@ -246,9 +246,7 @@ async def _change_consumer(
             conn.pending_notifications.append(changes)
             if conn._app_state is not None and conn._app_state.session is not None:
                 try:
-                    await _send_channel_notification(
-                        conn._app_state.session, room, changes
-                    )
+                    await _send_channel_notification(conn._app_state.session, room, changes)
                 except Exception:
                     log.warning(
                         "Failed to send channel notification for room %s",
@@ -483,10 +481,12 @@ mcp = FastMCP("tafelmusik", lifespan=lifespan)
 # FastMCP doesn't expose experimental_capabilities, so we wrap the low-level method.
 _original_init_options = mcp._mcp_server.create_initialization_options
 
+
 def _init_options_with_channel(**kwargs):
     kwargs.setdefault("experimental_capabilities", {})
     kwargs["experimental_capabilities"]["claude/channel"] = {}
     return _original_init_options(**kwargs)
+
 
 mcp._mcp_server.create_initialization_options = _init_options_with_channel
 
@@ -515,6 +515,16 @@ async def read_doc(room: str, ctx: Context) -> str:
     if not content:
         return f"(Document '{room}' is empty)"
     return content
+
+
+def _reanchor_summary(result: dict) -> str:
+    """Format re-anchoring results as a suffix for edit responses."""
+    parts = []
+    if result["reanchored"]:
+        parts.append(f"{len(result['reanchored'])} comment(s) re-anchored")
+    if result["orphaned"]:
+        parts.append(f"{len(result['orphaned'])} comment(s) orphaned")
+    return f" — {', '.join(parts)}" if parts else ""
 
 
 @mcp.tool()
@@ -556,16 +566,45 @@ async def edit_doc(
             conn.text.insert(len(str(conn.text)), content, attrs={"author": authors.CLAUDE})
         return f"Appended {len(content)} chars to '{room}'"
     elif mode == "replace_all":
+        comments_map: Map = conn.doc.get("comments", type=Map)
+        doc_len = len(str(conn.text))
+        affected = comments.collect_affected(conn.text, comments_map, 0, doc_len)
         document.replace_all(conn.text, content, author=authors.CLAUDE)
-        return f"Replaced all content in '{room}' ({len(content)} chars)"
+        result = comments.reanchor(conn.text, comments_map, affected)
+        suffix = _reanchor_summary(result)
+        return f"Replaced all content in '{room}' ({len(content)} chars){suffix}"
     elif mode == "replace_section":
         try:
+            comments_map: Map = conn.doc.get("comments", type=Map)
+            doc_content = str(conn.text)
+            heading = content.split("\n", 1)[0].strip()
+            bounds = document.find_section(doc_content, heading)
+            if bounds:
+                sec_start, sec_end = bounds
+                affected = comments.collect_affected(conn.text, comments_map, sec_start, sec_end)
+            else:
+                affected = []  # new section — nothing to re-anchor
             replaced = document.replace_section(conn.text, content, author=authors.CLAUDE)
+            if affected:
+                # Search within the new section's bounds
+                new_bounds = document.find_section(str(conn.text), heading)
+                if new_bounds:
+                    result = comments.reanchor(
+                        conn.text,
+                        comments_map,
+                        affected,
+                        search_start=new_bounds[0],
+                        search_end=new_bounds[1],
+                    )
+                else:
+                    result = comments.reanchor(conn.text, comments_map, affected)
+            else:
+                result = {"reanchored": [], "orphaned": []}
         except ValueError as e:
             return str(e)
-        heading = content.split("\n", 1)[0].strip()
         verb = "Replaced existing" if replaced else "Appended new"
-        return f"{verb} section '{heading}' in '{room}'"
+        suffix = _reanchor_summary(result)
+        return f"{verb} section '{heading}' in '{room}'{suffix}"
     elif mode == "patch":
         if not find:
             return "patch mode requires 'find' parameter"
@@ -592,8 +631,13 @@ async def load_doc(room: str, markdown: str, ctx: Context) -> str:
     """
     state = _get_state(ctx)
     conn = await state.connect(room)
+    comments_map: Map = conn.doc.get("comments", type=Map)
+    doc_len = len(str(conn.text))
+    affected = comments.collect_affected(conn.text, comments_map, 0, doc_len)
     document.replace_all(conn.text, markdown, author=authors.CLAUDE)
-    return f"Loaded {len(markdown)} chars into '{room}'"
+    result = comments.reanchor(conn.text, comments_map, affected)
+    suffix = _reanchor_summary(result)
+    return f"Loaded {len(markdown)} chars into '{room}'{suffix}"
 
 
 @mcp.tool()
@@ -713,14 +757,17 @@ async def list_comments(room: str, ctx: Context) -> str:
         comment = comments[comment_id]
         if not isinstance(comment, Map):
             continue
-        entries.append({
-            "id": comment_id,
-            "author": comment.get("author", "unknown"),
-            "quote": comment.get("quote", ""),
-            "body": comment.get("body", ""),
-            "resolved": comment.get("resolved", False),
-            "created": comment.get("created", ""),
-        })
+        entries.append(
+            {
+                "id": comment_id,
+                "author": comment.get("author", "unknown"),
+                "quote": comment.get("quote", ""),
+                "body": comment.get("body", ""),
+                "resolved": comment.get("resolved", False),
+                "orphaned": comment.get("orphaned", False),
+                "created": comment.get("created", ""),
+            }
+        )
 
     if not entries:
         return f"No comments on '{room}'"
@@ -730,7 +777,12 @@ async def list_comments(room: str, ctx: Context) -> str:
 
     lines = [f"Comments on '{room}' — {len(entries)} comment(s):\n"]
     for e in entries:
-        status = " [resolved]" if e["resolved"] else ""
+        flags = []
+        if e["resolved"]:
+            flags.append("resolved")
+        if e["orphaned"]:
+            flags.append("orphaned")
+        status = f" [{', '.join(flags)}]" if flags else ""
         lines.append(f"  {e['author']}{status}")
         lines.append(f"  > {e['quote']}")
         lines.append(f"  {e['body']}")
