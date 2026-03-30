@@ -423,7 +423,37 @@ class AppState:
         self.rooms[room] = conn
         return conn
 
+    async def start_room_poller(self, interval: float = 5.0) -> None:
+        """Start a background task that discovers and connects to new rooms."""
+        self._poll_interval = interval
+        self._poll_task = asyncio.create_task(self._poll_rooms())
+
+    async def _poll_rooms(self) -> None:
+        """Poll the ASGI server for rooms and connect to any new ones."""
+        http_url = _ws_to_http(self.server_url)
+        while True:
+            try:
+                response = await self.client.get(f"{http_url}/api/rooms")
+                response.raise_for_status()
+                rooms = response.json().get("rooms", [])
+                for room in rooms:
+                    if room not in self.rooms:
+                        try:
+                            await self.connect(room)
+                            log.info("Room poller: connected to %s", room)
+                        except (ConnectionError, TimeoutError):
+                            log.debug("Room poller: failed to connect to %s", room)
+            except Exception:
+                log.debug("Room poller: server unreachable, will retry")
+            await asyncio.sleep(self._poll_interval)
+
     async def close_all(self) -> None:
+        if hasattr(self, "_poll_task"):
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
         for conn in self.rooms.values():
             await conn.close()
         self.rooms.clear()
@@ -437,6 +467,7 @@ async def lifespan(app: FastMCP) -> AsyncIterator[AppState]:
     server_url = os.environ.get("TAFELMUSIK_URL", "ws://127.0.0.1:3456")
     async with httpx.AsyncClient() as client:
         state = AppState(client=client, server_url=server_url)
+        await state.start_room_poller()
         try:
             yield state
         finally:
@@ -484,12 +515,18 @@ async def read_doc(room: str, ctx: Context) -> str:
 
 
 @mcp.tool()
-async def edit_doc(room: str, content: str, mode: str, ctx: Context) -> str:
+async def edit_doc(
+    room: str,
+    mode: str,
+    ctx: Context,
+    content: str = "",
+    find: str = "",
+    replace: str = "",
+) -> str:
     """Edit a document.
 
     Args:
         room: Document room name
-        content: The content to write
         mode: How to apply the edit. One of:
             - "append": Add content to the end
             - "replace_all": Replace the entire document
@@ -497,24 +534,46 @@ async def edit_doc(room: str, content: str, mode: str, ctx: Context) -> str:
               with a markdown heading like "## Section Name"). Replaces everything
               from that heading to the next heading of equal or higher level.
               If the heading doesn't exist, appends a new section.
+              NOT allowed on h1 headings (# Title) — use replace_all instead.
+            - "patch": Content-addressed find-and-replace. Locates `find` text
+              literally, replaces with `replace` text. Exactly one match required.
+              Preserves authorship on surrounding text.
+        content: The content to write (required for append, replace_all, replace_section)
+        find: Text to find (required for patch mode)
+        replace: Replacement text (required for patch mode; empty string = delete)
     """
     state = _get_state(ctx)
     conn = await state.connect(room)
 
+    if mode in ("append", "replace_section") and not content:
+        return f"{mode} mode requires 'content' parameter"
+
     if mode == "append":
-        with conn.doc.transaction(origin="claude"):
-            conn.text.insert(len(str(conn.text)), content, attrs={"author": "claude"})
+        with conn.doc.transaction(origin=authors.CLAUDE):
+            conn.text.insert(len(str(conn.text)), content, attrs={"author": authors.CLAUDE})
         return f"Appended {len(content)} chars to '{room}'"
     elif mode == "replace_all":
         document.replace_all(conn.text, content, author=authors.CLAUDE)
         return f"Replaced all content in '{room}' ({len(content)} chars)"
     elif mode == "replace_section":
-        replaced = document.replace_section(conn.text, content, author=authors.CLAUDE)
+        try:
+            replaced = document.replace_section(conn.text, content, author=authors.CLAUDE)
+        except ValueError as e:
+            return str(e)
         heading = content.split("\n", 1)[0].strip()
         verb = "Replaced existing" if replaced else "Appended new"
         return f"{verb} section '{heading}' in '{room}'"
+    elif mode == "patch":
+        if not find:
+            return "patch mode requires 'find' parameter"
+        try:
+            document.patch(conn.text, find, replace, author=authors.CLAUDE)
+        except ValueError as e:
+            return f"Patch failed: {e}"
+        action = "Deleted" if not replace else "Patched"
+        return f"{action} {len(find)} chars in '{room}'"
     else:
-        return f"Unknown mode '{mode}'. Use 'append', 'replace_all', or 'replace_section'."
+        return f"Unknown mode '{mode}'. Use 'append', 'replace_all', 'replace_section', or 'patch'."
 
 
 @mcp.tool()

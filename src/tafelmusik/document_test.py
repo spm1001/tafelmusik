@@ -1,5 +1,6 @@
 """Tests for Y.Text document operations."""
 
+import pytest
 from hypothesis import given
 from hypothesis.strategies import composite, integers, lists, text
 from pycrdt import Doc, Text
@@ -248,7 +249,7 @@ def _build_section(heading: str, body: str) -> str:
 
 
 @given(
-    level=integers(min_value=1, max_value=4),
+    level=integers(min_value=2, max_value=4),
     new_body=md_body(),
     existing_body=md_body(),
 )
@@ -264,7 +265,7 @@ def test_prop_heading_preserved_after_replace(level, new_body, existing_body):
 
 
 @given(
-    level=integers(min_value=1, max_value=4),
+    level=integers(min_value=2, max_value=4),
     body_a=md_body(),
     body_b=md_body(),
     body_c=md_body(),
@@ -288,7 +289,7 @@ def test_prop_replace_preserves_other_sections(level, body_a, body_b, body_c):
     assert "Replaced body" in result
 
 
-@given(level=integers(min_value=1, max_value=4), body=md_body())
+@given(level=integers(min_value=2, max_value=4), body=md_body())
 def test_prop_idempotent_double_replace(level, body):
     """Replacing a section with itself twice leaves the document unchanged."""
     heading = "#" * level + " Idem"
@@ -305,7 +306,7 @@ def test_prop_idempotent_double_replace(level, body):
     assert after_first == after_second
 
 
-@given(level=integers(min_value=1, max_value=4), body=md_body(), new_body=md_body())
+@given(level=integers(min_value=2, max_value=4), body=md_body(), new_body=md_body())
 def test_prop_find_after_replace(level, body, new_body):
     """After replacing, find_section locates the section starting with the heading."""
     heading = "#" * level + " Findable"
@@ -323,7 +324,7 @@ def test_prop_find_after_replace(level, body, new_body):
 
 
 @given(
-    parent_level=integers(min_value=1, max_value=3),
+    parent_level=integers(min_value=2, max_value=3),
     parent_body=md_body(),
     child_body=md_body(),
     sibling_body=md_body(),
@@ -352,7 +353,7 @@ def test_prop_replace_subsumes_children(parent_level, parent_body, child_body, s
 
 
 @given(
-    level=integers(min_value=1, max_value=4),
+    level=integers(min_value=2, max_value=4),
     existing_body=md_body(),
     new_body=md_body(),
 )
@@ -369,3 +370,171 @@ def test_prop_append_creates_findable_section(level, existing_body, new_body):
 
     bounds = document.find_section(str(text), new_heading)
     assert bounds is not None, f"Appended heading '{new_heading}' not findable"
+
+
+# --- patch ---
+
+
+def test_patch_single_match():
+    text = _make_text("The quick brown fox jumps over the lazy dog.")
+    document.patch(text, "brown fox", "red fox", author=authors.TEST)
+    assert str(text) == "The quick red fox jumps over the lazy dog."
+
+
+def test_patch_no_match():
+    text = _make_text("Hello, world!")
+    with pytest.raises(ValueError, match="not found"):
+        document.patch(text, "missing text", "replacement", author=authors.TEST)
+    assert str(text) == "Hello, world!"  # unchanged
+
+
+def test_patch_ambiguous_match():
+    text = _make_text("foo bar foo baz")
+    with pytest.raises(ValueError, match="ambiguous"):
+        document.patch(text, "foo", "qux", author=authors.TEST)
+    assert str(text) == "foo bar foo baz"  # unchanged
+
+
+def test_patch_delete_only():
+    """Empty replace string deletes the matched text."""
+    text = _make_text("Hello cruel world")
+    document.patch(text, " cruel", "", author=authors.TEST)
+    assert str(text) == "Hello world"
+
+
+def test_patch_preserves_surrounding_authorship():
+    """Patch only touches the matched range — surrounding attrs are intact."""
+    doc = Doc()
+    doc["content"] = t = Text()
+    # Sameer writes the original
+    with doc.transaction(origin=authors.SAMEER):
+        t.insert(0, "Hello wrold!", attrs={"author": authors.SAMEER})
+    # Claude patches the typo
+    document.patch(t, "wrold", "world", author=authors.CLAUDE)
+    assert str(t) == "Hello world!"
+    # Check attrs: "Hello " and "!" should still be Sameer's
+    diff = t.diff()
+    # diff returns list of (insert, attrs) tuples for the formatted content
+    # Find the segments
+    segments = [(val, attrs) for val, attrs in diff]
+    # "Hello " should be Sameer's
+    assert segments[0] == ("Hello ", {"author": authors.SAMEER})
+    # "world" should be Claude's
+    assert segments[1] == ("world", {"author": authors.CLAUDE})
+    # "!" should be Sameer's
+    assert segments[2] == ("!", {"author": authors.SAMEER})
+
+
+def test_patch_multiline():
+    """Patch works across line boundaries."""
+    text = _make_text("line one\nline two\nline three\n")
+    document.patch(text, "line two\nline three", "line 2\nline 3", author=authors.TEST)
+    assert str(text) == "line one\nline 2\nline 3\n"
+
+
+# --- Editing grammar scenario tests ---
+# Each test proves a scenario from docs/editing-grammar.md has a safe path.
+
+
+def test_scenario_1_comment_driven_rewrite():
+    """Scenario 1: Rewrite a specific paragraph without touching the rest of the section.
+
+    patch mode targets just the paragraph text — surrounding content untouched.
+    """
+    text = _make_text(
+        "## Introduction\n\n"
+        "This is the first paragraph, which is fine.\n\n"
+        "This paragraph is too verbose and needs to be more concise.\n\n"
+        "This is the third paragraph, also fine.\n"
+    )
+    document.patch(
+        text,
+        "This paragraph is too verbose and needs to be more concise.",
+        "This paragraph is concise.",
+        author=authors.TEST,
+    )
+    result = str(text)
+    assert "This paragraph is concise." in result
+    assert "first paragraph, which is fine" in result
+    assert "third paragraph, also fine" in result
+
+
+def test_scenario_2_typo_fix_preserves_authorship():
+    """Scenario 2: Fix a typo in Sameer's text without stomping authorship.
+
+    patch mode touches only the matched characters — Sameer's attrs preserved.
+    """
+    doc = Doc()
+    doc["content"] = t = Text()
+    with doc.transaction(origin=authors.SAMEER):
+        t.insert(0, "The the quick brown fox.", attrs={"author": authors.SAMEER})
+
+    document.patch(t, "The the", "The", author=authors.CLAUDE)
+    assert str(t) == "The quick brown fox."
+
+    diff = t.diff()
+    segments = [(val, attrs) for val, attrs in diff]
+    # "The" was replaced by Claude
+    assert segments[0] == ("The", {"author": authors.CLAUDE})
+    # " quick brown fox." is still Sameer's
+    assert segments[1] == (" quick brown fox.", {"author": authors.SAMEER})
+
+
+def test_scenario_3_reorder_list():
+    """Scenario 3: Reorder a list within a section without affecting surrounding content.
+
+    patch mode finds the list block and replaces with reordered version.
+    """
+    text = _make_text(
+        "## Tasks\n\n"
+        "Some intro text.\n\n"
+        "1. Third task\n"
+        "2. First task\n"
+        "3. Second task\n\n"
+        "Some outro text.\n"
+    )
+    document.patch(
+        text,
+        "1. Third task\n2. First task\n3. Second task",
+        "1. First task\n2. Second task\n3. Third task",
+        author=authors.TEST,
+    )
+    result = str(text)
+    assert "1. First task\n2. Second task\n3. Third task" in result
+    assert "Some intro text." in result
+    assert "Some outro text." in result
+
+
+def test_scenario_4_h1_replace_refused():
+    """Scenario 4: replace_section on h1 heading raises ValueError.
+
+    The guard lives in document.py — any caller is protected, not just edit_doc.
+    """
+    text = _make_text("# Title\n\nIntro\n\n## Sub\n\nBody\n")
+    with pytest.raises(ValueError, match="refuses h1"):
+        document.replace_section(text, "# Title\n\nNew content\n", author=authors.TEST)
+    # Document unchanged after refused operation
+    assert "Intro" in str(text)
+    assert "Body" in str(text)
+
+
+def test_scenario_5_concurrent_non_overlapping_patches():
+    """Scenario 5: Two patches on different parts of same section coexist.
+
+    Unlike replace_section which stomps the entire section range,
+    patch targets specific text — non-overlapping patches don't conflict.
+    """
+    text = _make_text(
+        "## Design\n\n"
+        "Paragraph one has a typo: teh.\n\n"
+        "Paragraph two has a typo: recieve.\n"
+    )
+    # Two independent patches (simulating concurrent edits)
+    document.patch(text, "teh", "the", author=authors.CLAUDE)
+    document.patch(text, "recieve", "receive", author=authors.SAMEER)
+
+    result = str(text)
+    assert "the." in result
+    assert "receive." in result
+    assert "teh" not in result
+    assert "recieve" not in result

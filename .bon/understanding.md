@@ -68,6 +68,10 @@ The `connect_peer()` test helper in `conftest.py` handles this correctly: it wra
 
 When N libraries interact and something breaks, bisect the layers before theorising. The approach that cracked the cancel scope bug: bare pycrdt write (works) → write with observer (works) → write with background `asyncio.create_task` (works) → write with Provider (crashes). Each step adds one layer; the failing step isolates the interaction. This took 5 minutes after 20 minutes of theorising about anyio task groups and event types found nothing. The lesson generalises: test each pair of libraries in isolation before reasoning about the whole stack.
 
+## Persistence landmine: pycrdt-store squashing
+
+pycrdt-store 0.1.3 has a data-loss bug in SQLiteYStore.write() — the inline squash path has `ydoc.apply_update(update)` indented inside `if self._decompress:`, so without compression (the default) it replays into an empty Doc and destroys all stored updates. Tafelmusik disables squashing (`squash_after_inactivity_of=None`) as a workaround — correctness preserved, but the yupdates table grows unboundedly. Upstream fix is PR y-crdt/pycrdt-store#25. Re-enable squashing after the fix ships. If the upstream repo stays dormant, the correctly-written `_squash_document_history()` method in the PR could serve as a reference for owning persistence ourselves.
+
 ## Document operations
 
 replace_section finds headings by exact text match, not by position. This matters because in a CRDT, positions shift as peers edit concurrently. Text matching is stable; index-based matching isn't. The section boundary algorithm (same-or-higher heading level) matches CommonMark's implicit section structure.

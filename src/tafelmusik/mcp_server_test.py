@@ -37,12 +37,14 @@ async def server(tmp_path):
 
 
 @asynccontextmanager
-async def make_state(port, **kwargs):
+async def make_state(port, poll_interval=None, **kwargs):
     """Create an AppState with setup and teardown in the same task.
 
     Using a context manager (not a fixture) ensures that the anyio cancel
     scopes inside aconnect_ws are entered and exited from the same asyncio
     Task. Pytest-asyncio fixture teardown can run in a different task context.
+
+    Pass poll_interval to start the room poller (disabled by default in tests).
     """
     async with httpx.AsyncClient() as client:
         state = AppState(
@@ -51,6 +53,8 @@ async def make_state(port, **kwargs):
             keepalive=None,  # No keepalive in tests
             **kwargs,
         )
+        if poll_interval is not None:
+            await state.start_room_poller(interval=poll_interval)
         try:
             yield state
         finally:
@@ -725,3 +729,162 @@ async def test_no_channel_notification_without_session(server):
         # pending_notifications should be populated (existing behaviour)
         assert len(conn.pending_notifications) > 0
         # No crash — graceful fallback
+
+
+# --- Patch mode tests ---
+
+
+async def test_patch_via_mcp(server):
+    """patch() works through the MCP connection layer — surgical find-and-replace."""
+    from tafelmusik import document
+
+    async with make_state(server) as state:
+        conn = await state.connect("test-patch")
+        document.replace_all(
+            conn.text,
+            "The quick brown fox jumps over the lazy dog.",
+            author=authors.CLAUDE,
+        )
+        await asyncio.sleep(0.3)
+
+        document.patch(conn.text, "brown fox", "red fox", author=authors.CLAUDE)
+        assert str(conn.text) == "The quick red fox jumps over the lazy dog."
+        await asyncio.sleep(0.5)  # Let update propagate to server
+
+    # Verify patch is visible to another client
+    async with connect_peer(server, "test-patch") as text:
+        assert "red fox" in str(text)
+        assert "brown fox" not in str(text)
+
+
+async def test_patch_preserves_authorship_via_mcp(server):
+    """Patch preserves authorship attrs on untouched text through MCP."""
+    from tafelmusik import document
+
+    async with make_state(server) as state:
+        conn = await state.connect("test-patch-authorship")
+
+        # Browser writes content (Sameer's authorship)
+        async with connect_peer(server, "test-patch-authorship") as browser:
+            with browser.doc.transaction(origin=authors.SAMEER):
+                browser.insert(0, "Hello wrold!", attrs={"author": authors.SAMEER})
+            await asyncio.sleep(0.5)
+
+        # Wait for sync
+        await asyncio.sleep(0.5)
+
+        # Claude patches the typo
+        document.patch(conn.text, "wrold", "world", author=authors.CLAUDE)
+        assert str(conn.text) == "Hello world!"
+
+        # Check authorship preservation
+        diff = conn.text.diff()
+        segments = [(val, attrs) for val, attrs in diff]
+        assert segments[0] == ("Hello ", {"author": authors.SAMEER})
+        assert segments[1] == ("world", {"author": authors.CLAUDE})
+        assert segments[2] == ("!", {"author": authors.SAMEER})
+
+
+async def test_patch_error_no_match_via_mcp(server):
+    """patch() raises ValueError when text not found through MCP."""
+    from tafelmusik import document
+
+    async with make_state(server) as state:
+        conn = await state.connect("test-patch-nomatch")
+        conn.text += "Hello world"
+        await asyncio.sleep(0.3)
+
+        with pytest.raises(ValueError, match="not found"):
+            document.patch(conn.text, "missing", "replacement", author=authors.CLAUDE)
+        assert str(conn.text) == "Hello world"  # unchanged
+
+
+# --- h1 replace_section guard ---
+
+
+# --- Room poller tests ---
+
+
+async def test_room_poller_discovers_new_room(server):
+    """Room poller connects to a room created by a browser client, without any tool call."""
+    mock_session = MockSession()
+
+    async with make_state(server, poll_interval=0.5) as state:
+        state.session = mock_session
+
+        # No rooms connected yet
+        assert len(state.rooms) == 0
+
+        # Browser creates a room the MCP server has never seen
+        async with connect_peer(server, "poller-discovery-test") as browser:
+            browser += "# Hello from browser\n\nSameer is writing.\n"
+            await asyncio.sleep(0.5)
+
+            # Wait for poller to discover and connect (poll interval 0.5s + sync)
+            await asyncio.sleep(2.0)
+
+            # MCP server should now be connected to the room
+            assert "poller-discovery-test" in state.rooms
+            conn = state.rooms["poller-discovery-test"]
+            assert "Hello from browser" in str(conn.text)
+
+            # Now browser edits — observer should fire notification
+            browser += "\nAnother edit from Sameer."
+            await asyncio.sleep(0.5)
+
+        # Wait for debounce (2s) + margin
+        await asyncio.sleep(3.0)
+
+        # Channel notification should have been sent for the browser edit
+        assert len(conn.pending_notifications) > 0 or len(mock_session.messages) > 0
+
+
+async def test_room_poller_survives_server_down():
+    """Room poller handles unreachable server gracefully — no crash, retries on next interval."""
+    async with httpx.AsyncClient() as client:
+        state = AppState(
+            client=client,
+            server_url="ws://127.0.0.1:1",  # nothing listening
+            keepalive=None,
+        )
+        await state.start_room_poller(interval=0.3)
+
+        # Let the poller run several cycles against a dead server
+        await asyncio.sleep(1.5)
+
+        # Poller should still be alive (not crashed)
+        assert not state._poll_task.done()
+        # No rooms connected (server unreachable)
+        assert len(state.rooms) == 0
+
+        await state.close_all()
+        # Poller task should be cancelled cleanly
+        assert state._poll_task.done()
+
+
+async def test_room_poller_ignores_already_connected(server):
+    """Room poller doesn't reconnect to rooms already in state.rooms."""
+    async with make_state(server, poll_interval=0.5) as state:
+        # Manually connect to a room first
+        conn = await state.connect("already-connected")
+        conn.text += "Existing content"
+        await asyncio.sleep(0.3)
+
+        # Let poller run — it should see "already-connected" in the room list
+        # but NOT create a new connection
+        await asyncio.sleep(1.5)
+
+        # Same connection object — not replaced
+        assert state.rooms["already-connected"] is conn
+        assert "Existing content" in str(conn.text)
+
+
+def test_heading_level_detection():
+    """heading_level correctly identifies heading levels."""
+    from tafelmusik.document import heading_level
+
+    assert heading_level("# Title") == 1
+    assert heading_level("## Section") == 2
+    assert heading_level("### Subsection") == 3
+    assert heading_level("Not a heading") is None
+    assert heading_level("") is None

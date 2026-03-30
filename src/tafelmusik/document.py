@@ -65,10 +65,19 @@ def replace_section(text: Text, new_content: str, *, author: str) -> bool:
     The section extends from the heading to the next heading of equal or higher
     level (fewer #s), or to the end of the document.
 
+    Raises ValueError on h1 headings — h1 sections span the entire document,
+    so replace_section would silently destroy all content. Use replace_all instead.
+
     Returns True if an existing section was replaced, False if appended as new.
     """
     content = str(text)
     heading = new_content.split("\n", 1)[0].strip()
+    level = heading_level(heading)
+    if level == 1:
+        raise ValueError(
+            f"replace_section refuses h1 heading '{heading}' — it would replace "
+            f"the entire document. Use replace_all instead."
+        )
     bounds = find_section(content, heading)
 
     with text.doc.transaction(origin=author):
@@ -143,7 +152,7 @@ def find_section(content: str, heading: str) -> tuple[int, int] | None:
     at the same or higher level, or len(content).
     """
     heading = heading.strip()
-    level = _heading_level(heading)
+    level = heading_level(heading)
     if level is None:
         return None
 
@@ -173,7 +182,30 @@ def find_section(content: str, heading: str) -> tuple[int, int] | None:
     return (start, len(content))
 
 
-def _heading_level(line: str) -> int | None:
+def patch(text: Text, find: str, replace: str, *, author: str) -> None:
+    """Content-addressed find-and-replace on a Y.Text.
+
+    Matches `find` literally in the current text. Exactly one match is required —
+    zero matches raises ValueError (text not found), two or more raises ValueError
+    (ambiguous match). Only the matched range is deleted and replaced, so authorship
+    attrs on surrounding text are preserved.
+    """
+    content = str(text)
+    first = content.find(find)
+    if first == -1:
+        raise ValueError(f"patch: text not found: {find!r}")
+    second = content.find(find, first + 1)
+    if second != -1:
+        raise ValueError(
+            f"patch: ambiguous match — found {find!r} at positions {first} and {second}"
+        )
+    with text.doc.transaction(origin=author):
+        del text[first : first + len(find)]
+        if replace:
+            text.insert(first, replace, attrs={"author": author})
+
+
+def heading_level(line: str) -> int | None:
     """Return heading level (1-6) or None if not a markdown heading."""
     m = _HEADING_RE.match(line.strip())
     return len(m.group(1)) if m else None
