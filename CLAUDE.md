@@ -4,20 +4,19 @@ Collaborative editing layer — Yjs Y.Text + CodeMirror 6 + pycrdt. Both Sameer 
 
 ## Architecture
 
-Three processes, one codebase:
+Two processes, one codebase:
 
 1. **ASGI server** (`asgi_server.py`) — always-running (systemd). Owns room management (Room + RoomManager), serves web editor, handles WebSocket sync. Zero pycrdt.websocket dependency — uses public pycrdt APIs only.
-2. **MCP server** (`mcp_server.py`) — ephemeral (spawned by CC). Connects to ASGI server via WebSocket as pycrdt client. Provides tools: `read_doc`, `edit_doc`, `load_doc`, `list_docs` (+ future: `add_comment`, `list_comments`, `export_to_docs`).
-3. **Channel server** (`channel_server.py`) — ephemeral (spawned by CC). Observes Y.Text changes, pushes notifications.
+2. **MCP server** (`mcp_server.py`) — ephemeral (spawned by CC). Connects to ASGI server via WebSocket as pycrdt client. Provides tools (`read_doc`, `edit_doc`, `load_doc`, `list_docs`) AND channel notifications (push alerts when Sameer edits). The observer, debouncer, and notification sender all live here because transaction origins are local to a Doc instance — they don't survive the wire, so filtering Claude's own edits requires the observer to be in the same process as the Doc.
 
 ## Module Layout
 
 ```
 src/tafelmusik/
   asgi_server.py       # ASGI entry point
-  mcp_server.py        # MCP entry point
-  channel_server.py    # Channel entry point
-  document.py          # Y.Text operations (shared by MCP + channel)
+  mcp_server.py        # MCP entry point (tools + channel notifications)
+  document.py          # Y.Text operations
+  authors.py           # Identity constants (CLAUDE, SAMEER, TEST)
   comments.py          # Y.Map comment operations + StickyIndex
   uploads.py           # Image upload handling
   *_test.py            # Tests adjacent to source
@@ -59,7 +58,7 @@ Mac setup (one-time): `git remote add hezza modha@hezza:Repos/batterie/tafelmusi
 ## Key Conventions
 
 - **Private APIs:** When using library internals (underscore-prefixed), add a comment block naming the private APIs, the validated version, and a runtime assertion. File a bon to own the functionality via public APIs. Don't block on it — ship first, own later.
-- **Port:** 3456 (ASGI server). MCP/channel servers discover via `TAFELMUSIK_URL` env var.
+- **Port:** 3456 (ASGI server). MCP server discovers via `TAFELMUSIK_URL` env var.
 - **Persistence:** SQLiteYStore stores updates (not documents). Squashes after 60s idle. See `.bon/understanding.md` for the full mental model.
 - **Version:** Single source in `.claude-plugin/plugin.json`.
 - **Tests:** Adjacent to source (`*_test.py`). pytest + pytest-asyncio.
@@ -75,6 +74,8 @@ Mac setup (one-time): `git remote add hezza modha@hezza:Repos/batterie/tafelmusi
 - `observe()` callbacks are synchronous — use `asyncio.Queue.put_nowait()` + async consumer. The observer callback in `mcp_server.py` has a try/except safety net because an unhandled exception would crash the sync loop.
 - **Authorship & origins:** All writes through `document.py` must be wrapped in `doc.transaction(origin=author)` and use `text.insert(..., attrs={"author": author})`. Author constants live in `authors.py`. The MCP observer uses `txn.origin` to filter Claude's own edits — if you add a write path without the origin, Claude gets self-notifications. Origins are local to a Doc instance (not serialized over the wire), which is why the observer must live in the MCP server process, not a separate channel server.
 - **`find_section` is code-block-aware.** Headings inside fenced code blocks (``` or ~~~) are ignored. `diff_sections` and `_extract_sections` use the same logic.
+- **Channel notifications:** The MCP server declares `experimental: {"claude/channel": {}}` capability and sends `notifications/claude/channel` via `ServerSession.send_message()` (low-level escape hatch, mcp 1.26.0). The typed `send_notification()` API only accepts the closed `ServerNotification` union — custom methods must bypass it. Session is captured on first tool call and stored on `AppState`. To receive notifications, start Claude Code with `--dangerously-load-development-channels server:tafelmusik`.
+- **`replace_section` on h1 replaces the entire document.** There's no equal-or-higher heading to stop at, so the section boundary extends to EOF. Use `replace_all` instead when editing top-level content, or include all sub-sections in the replacement. See `docs/editing-grammar.md` for the full editing ergonomics analysis.
 - Python MCP SDK: custom notifications require low-level `Server` API, not FastMCP.
 - `aconnect_ws` uses anyio cancel scopes that are task-bound. The WebSocket and sync loop must run in the SAME asyncio Task — `_sync_task()` in `mcp_server.py` wraps both. Separating them across tasks causes `RuntimeError: Attempted to exit cancel scope in a different task`. Same applies to test fixtures — use `@asynccontextmanager` helpers so `__aenter__`/`__aexit__` run in the same Task. The `connect_peer()` test helper in `conftest.py` handles this correctly.
 - The MCP server owns its sync protocol (~40 lines in `_sync_loop`/`_send_updates`/`_heartbeat`) using only public pycrdt APIs: `create_sync_message`, `handle_sync_message`, `create_update_message`, `doc.events()`. No Provider subclass, no private API coupling.

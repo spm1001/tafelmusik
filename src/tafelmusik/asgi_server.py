@@ -223,7 +223,12 @@ def create_app(
         (SQLiteYStore,),
         {
             "db_path": _db_path,
-            "squash_after_inactivity_of": 60,  # compact updates after 60s of no edits
+            # Squashing DISABLED — pycrdt-store 0.1.3 has a data-loss bug:
+            # SQLiteYStore.write() lines 480-483 only call apply_update()
+            # inside `if self._decompress:`, so without compression enabled
+            # the squash replays into an empty Doc and destroys all data.
+            # Re-enable after upstream fix.
+            "squash_after_inactivity_of": None,
         },
     )
 

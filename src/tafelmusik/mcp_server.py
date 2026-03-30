@@ -29,6 +29,9 @@ import httpx
 from anyio import Event, create_task_group, sleep
 from httpx_ws import aconnect_ws
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.session import ServerSession
+from mcp.shared.message import SessionMessage
+from mcp.types import JSONRPCMessage, JSONRPCNotification
 from pycrdt import (
     Doc,
     Text,
@@ -164,6 +167,43 @@ async def _sync_loop(
 # --- Change observer: debounce + section diff ---
 
 
+async def _send_channel_notification(
+    session: ServerSession,
+    room: str,
+    changes: list[tuple[str, str]],
+) -> None:
+    """Send a channel notification to Claude Code with section-level diffs.
+
+    Uses the low-level ServerSession.send_message() to send a custom
+    JSONRPCNotification — the typed send_notification() API doesn't support
+    the notifications/claude/channel method.
+
+    Private API: ServerSession.send_message() (mcp 1.26.0)
+    Validated: session.py:669 — experimental, documented as "may change"
+    """
+    assert hasattr(session, "send_message"), (
+        "ServerSession.send_message() not found — MCP SDK API may have changed"
+    )
+
+    summary_parts = []
+    for heading, kind in changes:
+        if kind == "modified":
+            summary_parts.append(f"Modified section: {heading}")
+        elif kind == "added":
+            summary_parts.append(f"Added section: {heading}")
+        elif kind == "removed":
+            summary_parts.append(f"Removed section: {heading}")
+    content = f"Document '{room}' edited by Sameer:\n" + "\n".join(summary_parts)
+
+    notification = JSONRPCNotification(
+        jsonrpc="2.0",
+        method="notifications/claude/channel",
+        params={"content": content, "meta": {"room": room}},
+    )
+    msg = SessionMessage(message=JSONRPCMessage(notification))
+    await session.send_message(msg)
+
+
 async def _change_consumer(
     conn: RoomConnection,
     room: str,
@@ -174,6 +214,9 @@ async def _change_consumer(
     Waits for silence (no new changes for ``debounce`` seconds) before
     processing. Accumulates old→new across rapid edits so the diff
     reflects the full change, not each keystroke.
+
+    When a session is available, sends channel notifications to Claude Code.
+    Falls back to pending_notifications list when no session is captured yet.
     """
     while True:
         # Wait for first change
@@ -198,6 +241,17 @@ async def _change_consumer(
         if changes:
             log.info("Room %s: remote edit — %s", room, changes)
             conn.pending_notifications.append(changes)
+            if conn._app_state is not None and conn._app_state.session is not None:
+                try:
+                    await _send_channel_notification(
+                        conn._app_state.session, room, changes
+                    )
+                except Exception:
+                    log.warning(
+                        "Failed to send channel notification for room %s",
+                        room,
+                        exc_info=True,
+                    )
 
 
 # --- Connection management ---
@@ -227,6 +281,7 @@ class RoomConnection:
     _cached_content: str = ""
     _consumer_task: asyncio.Task | None = None
     _observe_subscription: Any = None
+    _app_state: Any = None  # AppState, set after construction (forward ref)
 
     async def close(self) -> None:
         if self._observe_subscription is not None:
@@ -256,6 +311,7 @@ class AppState:
     rooms: dict[str, RoomConnection] = field(default_factory=dict)
     sync_timeout: float = 10.0
     keepalive: float | None = 60.0
+    session: ServerSession | None = None
 
     async def connect(self, room: str) -> RoomConnection:
         """Get or create a connection to a room.
@@ -339,6 +395,7 @@ class AppState:
             dead=dead,
             _task=task,
             _cached_content=str(text),
+            _app_state=self,
         )
 
         def _on_text_change(event, txn):
@@ -388,9 +445,24 @@ async def lifespan(app: FastMCP) -> AsyncIterator[AppState]:
 
 mcp = FastMCP("tafelmusik", lifespan=lifespan)
 
+# Override create_initialization_options to declare claude/channel capability.
+# FastMCP doesn't expose experimental_capabilities, so we wrap the low-level method.
+_original_init_options = mcp._mcp_server.create_initialization_options
+
+def _init_options_with_channel(**kwargs):
+    kwargs.setdefault("experimental_capabilities", {})
+    kwargs["experimental_capabilities"]["claude/channel"] = {}
+    return _original_init_options(**kwargs)
+
+mcp._mcp_server.create_initialization_options = _init_options_with_channel
+
 
 def _get_state(ctx: Context) -> AppState:
-    return ctx.request_context.lifespan_context
+    state = ctx.request_context.lifespan_context
+    if state.session is None:
+        state.session = ctx.request_context.session
+        log.info("Captured MCP session for channel notifications")
+    return state
 
 
 # --- Tools ---
@@ -480,6 +552,33 @@ async def list_docs(ctx: Context) -> str:
         return "Documents:\n" + "\n".join(f"  - {r}" for r in rooms)
     except httpx.HTTPError:
         return "Could not list documents (is the Tafelmusik server running?)"
+
+
+@mcp.tool()
+async def inspect_doc(room: str, ctx: Context) -> str:
+    """Inspect a document's Y.Text with formatting attributes.
+
+    Returns the text as a sequence of attributed chunks — each chunk is a
+    run of text sharing the same attrs (e.g. author). This reveals the
+    CRDT layer that str(text) hides: who wrote what, and whether any
+    unexpected formatting attributes are present.
+
+    Args:
+        room: Document room name
+    """
+    state = _get_state(ctx)
+    conn = await state.connect(room)
+    chunks = conn.text.diff()
+    if not chunks:
+        return f"(Document '{room}' is empty)"
+    lines = []
+    for content, attrs in chunks:
+        preview = repr(content) if len(content) <= 80 else repr(content[:77] + "...")
+        if attrs:
+            lines.append(f"  {preview}  attrs={attrs}")
+        else:
+            lines.append(f"  {preview}")
+    return f"Document '{room}' — {len(chunks)} chunk(s):\n" + "\n".join(lines)
 
 
 if __name__ == "__main__":

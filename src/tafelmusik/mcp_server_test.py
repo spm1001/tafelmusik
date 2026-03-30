@@ -16,7 +16,7 @@ from pycrdt import Doc, Text, YMessageType, YSyncMessageType
 from tafelmusik import authors
 from tafelmusik.asgi_server import create_app
 from tafelmusik.conftest import MockChannel, connect_peer, get_free_port
-from tafelmusik.mcp_server import AppState, _sync_loop
+from tafelmusik.mcp_server import AppState, _send_channel_notification, _sync_loop
 
 
 @pytest.fixture
@@ -632,3 +632,96 @@ async def test_keepalive_detects_dead_connection(tmp_path):
         srv.should_exit = True
         await asyncio.sleep(0.5)
         server_task.cancel()
+
+
+# --- Channel notification tests ---
+
+
+class MockSession:
+    """Captures messages sent via send_message() for assertion."""
+
+    def __init__(self):
+        self.messages = []
+
+    async def send_message(self, message):
+        self.messages.append(message)
+
+
+async def test_send_channel_notification_format():
+    """_send_channel_notification sends correctly shaped JSONRPCNotification."""
+    session = MockSession()
+    changes = [("## API", "modified"), ("## New", "added")]
+
+    await _send_channel_notification(session, "test-room", changes)
+
+    assert len(session.messages) == 1
+    msg = session.messages[0]
+    notification = msg.message.root
+    assert notification.method == "notifications/claude/channel"
+    assert "test-room" in notification.params["content"]
+    assert "Modified section: ## API" in notification.params["content"]
+    assert "Added section: ## New" in notification.params["content"]
+    assert notification.params["meta"]["room"] == "test-room"
+
+
+async def test_channel_notification_on_remote_edit(server):
+    """Browser edit triggers channel notification when session is captured."""
+    from tafelmusik import document
+
+    mock_session = MockSession()
+
+    async with make_state(server) as state:
+        state.session = mock_session
+
+        conn = await state.connect("channel-notify-test")
+
+        # Claude writes initial content
+        document.replace_all(
+            conn.text,
+            "## Intro\n\nOriginal.\n\n## Details\n\nSome details.\n",
+            author=authors.CLAUDE,
+        )
+        await asyncio.sleep(0.5)
+        assert len(mock_session.messages) == 0  # Claude's edit: no notification
+
+        # Browser edits the Details section
+        async with connect_peer(server, "channel-notify-test") as browser:
+            content = str(browser)
+            details_start = content.index("## Details")
+            del browser[details_start:]
+            browser.insert(details_start, "## Details\n\nSameer rewrote this.\n")
+            await asyncio.sleep(0.5)
+
+        # Wait for debounce (2s) + margin
+        await asyncio.sleep(3.0)
+
+        # Channel notification should have been sent
+        assert len(mock_session.messages) > 0
+        notification = mock_session.messages[0].message.root
+        assert notification.method == "notifications/claude/channel"
+        assert "channel-notify-test" in notification.params["content"]
+
+
+async def test_no_channel_notification_without_session(server):
+    """Without a captured session, changes go to pending_notifications only."""
+    from tafelmusik import document
+
+    async with make_state(server) as state:
+        # Don't set state.session — leave it None
+        conn = await state.connect("no-session-test")
+
+        document.replace_all(
+            conn.text, "## Test\n\nOriginal.\n", author=authors.CLAUDE
+        )
+        await asyncio.sleep(0.5)
+
+        # Browser edits
+        async with connect_peer(server, "no-session-test") as browser:
+            browser += "\nBrowser edit"
+            await asyncio.sleep(0.5)
+
+        await asyncio.sleep(3.0)
+
+        # pending_notifications should be populated (existing behaviour)
+        assert len(conn.pending_notifications) > 0
+        # No crash — graceful fallback
