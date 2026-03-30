@@ -234,6 +234,10 @@ async def _push_resync(conn: RoomConnection, room: str) -> None:
     if conn._app_state is None or conn._app_state.session is None:
         return
     drift = _compute_drift(conn, room)
+    log.info(
+        "Room %s: idle timer fired — drift %dB (threshold %dB, %s)",
+        room, drift, DRIFT_THRESHOLD, "pushing" if drift > DRIFT_THRESHOLD else "skipping",
+    )
     if drift <= DRIFT_THRESHOLD:
         return
     content = (
@@ -290,6 +294,10 @@ async def _comment_consumer(
 
         drift = _compute_drift(conn, room)
         high_drift = drift > DRIFT_THRESHOLD
+        log.info(
+            "Room %s: comment notification — drift %dB (%s, threshold %dB)",
+            room, drift, "high" if high_drift else "low", DRIFT_THRESHOLD,
+        )
 
         for event in events:
             comment_text = (
@@ -347,8 +355,8 @@ class RoomConnection:
     the same asyncio Task to avoid anyio cancel scope cross-task violations.
 
     Two observers:
-    - Text observer: updates _cached_content, computes drift, resets idle
-      timer on every remote change. Does NOT send notifications directly.
+    - Text observer: resets idle timer on every remote change. Does NOT
+      send notifications directly.
     - Comment observer: detects new comments from non-Claude authors,
       queues them for notification via _comment_queue.
 
@@ -362,8 +370,7 @@ class RoomConnection:
     synced: Event
     dead: Event
     _task: asyncio.Task
-    _cached_content: str = ""
-    _observe_subscription: Any = None  # text observer (cache + drift)
+    _observe_subscription: Any = None  # text observer (idle timer)
     _comment_observe_subscription: Any = None  # comment observer
     _comment_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     _comment_consumer_task: asyncio.Task | None = None
@@ -496,16 +503,15 @@ class AppState:
             synced=synced,
             dead=dead,
             _task=task,
-            _cached_content=str(text),
             _app_state=self,
         )
 
         def _on_text_change(event, txn):
-            """Synchronous observe callback — cache, drift, idle timer.
+            """Synchronous observe callback — idle timer management.
 
-            Updates _cached_content on every change. On remote edits
-            (non-Claude), resets the idle timer. When the idle timer fires
-            (no edits for IDLE_TIMEOUT), _push_resync runs if drift is high.
+            On remote edits (non-Claude), resets the idle timer. When the
+            idle timer fires (no edits for IDLE_TIMEOUT), _push_resync
+            runs if drift is high.
 
             Does NOT send notifications directly — comments are the
             collaboration protocol. The idle timer handles the "major
@@ -516,7 +522,6 @@ class AppState:
             commits, crashing the sync loop.
             """
             try:
-                conn._cached_content = str(text)
                 if txn.origin != authors.CLAUDE and self.idle_timeout is not None:
                     # Reset idle timer on each remote edit
                     if conn._idle_timer is not None:

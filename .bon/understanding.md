@@ -20,11 +20,11 @@ Three phases, all designed and agreed:
 
 **The CRDT duplication trap:** Every file hydration creates NEW CRDT operations (new client ID, new clocks). Any peer holding old operations will merge both sets — producing duplicated content. Yjs merges by operation identity, not content identity: two inserts of "hello" from different client IDs produce "hellohello". Room retention (keeping file-backed rooms in memory) prevents duplication on idle reconnects, but not across server restarts where the room is necessarily fresh. SQLite preserves operation identity across room lifecycles within a process; file hydration should be treated as a one-time seed, not a repeatable operation. The browser-side fix (tfm-wiseha) is: detect server restart and discard the stale local Y.Doc before reconnecting.
 
-**Phase 2 — Drift detection:** State vector drift score (doc.get_update(snapshot) byte size) as a native CRDT metric for detecting when the CRDT has diverged significantly from the file. Awareness protocol patterns from Yjs for Phase 2 signaling.
+**Phase 2 — Done (tfm-becitu, tfm-semame, tfm-nocaga).** Comment operations extracted to `comments.py`. Y.Map observer replaced Y.Text observer for notifications — document-body edits produce silence, comments are the turn signal. Drift tracking via state vector snapshots: `doc.get_update(snapshot)` byte size measures staleness, gates full-doc pushes alongside comments or on idle timeout. Three push triggers: (a) comment + high drift = full doc + comment, (b) idle 30s + high drift = automatic resync, (c) room connect = initial context push. `DRIFT_THRESHOLD` (1024B) and `IDLE_TIMEOUT` (30s) are tuning parameters — journalctl logs drift scores on every comment and idle timer fire for empirical tuning. Remaining: tfm-napari (remove `read_doc` from tool surface).
 
-**Phase 3 — Spawn-on-comment:** Comments as turn signal — when Sameer comments, Claude gets notified and can respond. Not continuous document-body notifications.
+**Phase 3 — Spawn-on-comment (tfm-rohudu):** When a comment arrives with no MCP peer connected, spawn Claude on hezza to respond.
 
-**Key implementation brief** lives in `.bon/contributions/2026-03-30T163000.md` with specific pseudocode, file-change matrix, and gotchas. The spike tests (`calute_spike_test.py`, 9 tests) validate hydrate→edit→comment→flush→re-hydrate round-trip at the pure pycrdt level — production goes through RoomManager, WebSocket sync, two processes.
+**Implementation brief** lives in `docs/calute-phase2-brief.md` with sequencing constraints and pseudocode. The spike tests (`calute_spike_test.py`, 9 tests) validate hydrate→edit→comment→flush→re-hydrate round-trip at the pure pycrdt level — production goes through RoomManager, WebSocket sync, two processes.
 
 ## Comments: inline reactions, not editorial workflow
 

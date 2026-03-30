@@ -431,18 +431,6 @@ async def test_text_edit_produces_no_notification(server):
         assert conn._comment_queue.empty()
 
 
-async def test_text_observer_updates_cached_content(server):
-    """Text observer still maintains _cached_content for drift tracking (nocaga)."""
-    async with make_state(server) as state:
-        conn = await state.connect("cache-test")
-        assert conn._cached_content == ""
-
-        async with connect_peer(server, "cache-test") as browser:
-            browser += "Hello from Sameer"
-            await asyncio.sleep(0.5)
-
-        assert "Hello from Sameer" in conn._cached_content
-
 
 async def test_comment_observer_fires_on_remote_comment(server):
     """New comment from non-Claude author queues a notification event."""
