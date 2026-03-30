@@ -11,9 +11,9 @@ import httpx
 import pytest
 import uvicorn
 from anyio import Event
-from pycrdt import Doc, Text, YMessageType, YSyncMessageType
+from pycrdt import Doc, Map, Text, YMessageType, YSyncMessageType
 
-from tafelmusik import authors
+from tafelmusik import authors, comments
 from tafelmusik.asgi_server import create_app
 from tafelmusik.conftest import MockChannel, connect_peer, get_free_port
 from tafelmusik.mcp_server import AppState, _send_channel_notification, _sync_loop
@@ -404,125 +404,139 @@ async def test_reconnect_after_server_restart(tmp_path):
         task2.cancel()
 
 
-# --- Observer tests: change_queue and origin filtering ---
+# --- Observer tests: comment observer and origin filtering ---
 
 
-async def test_observer_notifies_on_remote_edit(server):
-    """Browser edits produce pending notifications after debounce."""
+async def test_text_edit_produces_no_notification(server):
+    """Browser typing in document body produces zero comment notifications."""
     async with make_state(server) as state:
-        conn = await state.connect("observer-test")
-        assert len(conn.pending_notifications) == 0
+        conn = await state.connect("text-silence-test")
 
-        # Simulate a browser edit via connect_peer
-        async with connect_peer(server, "observer-test") as browser:
+        async with connect_peer(server, "text-silence-test") as browser:
             browser += "Hello from Sameer"
             await asyncio.sleep(0.5)
 
-        # Wait for debounce (2s) + margin
-        await asyncio.sleep(3.0)
-        assert len(conn.pending_notifications) > 0
+        # Wait for any debounce + margin
+        await asyncio.sleep(1.5)
+        assert conn._comment_queue.empty()
 
 
-async def test_observer_skips_claude_edits(server):
-    """Claude's own edits (origin='claude') produce no notifications."""
-    from tafelmusik import document
+async def test_text_observer_updates_cached_content(server):
+    """Text observer still maintains _cached_content for drift tracking (nocaga)."""
+    async with make_state(server) as state:
+        conn = await state.connect("cache-test")
+        assert conn._cached_content == ""
 
+        async with connect_peer(server, "cache-test") as browser:
+            browser += "Hello from Sameer"
+            await asyncio.sleep(0.5)
+
+        assert "Hello from Sameer" in conn._cached_content
+
+
+async def test_comment_observer_fires_on_remote_comment(server):
+    """New comment from non-Claude author queues a notification event."""
+    async with make_state(server) as state:
+        conn = await state.connect("comment-fire-test")
+        conn.text += "Hello world"
+
+        # Simulate browser adding a comment (no origin = same as sync apply)
+        with conn.doc.transaction():
+            c = Map()
+            conn.comments_map["sameer-1"] = c
+            c["author"] = "sameer"
+            c["quote"] = "Hello"
+            c["body"] = "fix this"
+            c["resolved"] = False
+
+        assert not conn._comment_queue.empty()
+        event = conn._comment_queue.get_nowait()
+        assert event["comment_id"] == "sameer-1"
+        assert event["author"] == "sameer"
+        assert event["quote"] == "Hello"
+        assert event["body"] == "fix this"
+
+
+async def test_comment_observer_ignores_claude_comments(server):
+    """Claude's own comments (origin=CLAUDE) produce no notification."""
     async with make_state(server) as state:
         conn = await state.connect("self-filter-test")
+        conn.text += "Hello world"
 
-        # Claude writes — should produce no notification
-        document.replace_all(
-            conn.text, "# Claude's doc\n\nWritten by Claude.\n", author=authors.CLAUDE
+        comments.add_comment(
+            conn.doc, conn.text, conn.comments_map,
+            "Hello", "my comment", author=authors.CLAUDE,
         )
 
-        # Wait longer than debounce to confirm nothing arrives
-        await asyncio.sleep(3.0)
-        assert len(conn.pending_notifications) == 0, "Claude's edit should not notify"
+        assert conn._comment_queue.empty(), "Claude's comment should not notify"
 
 
-async def test_observer_notifies_remote_but_not_claude(server):
-    """Mixed scenario: Claude writes, then browser writes. Only browser edit notifies."""
-    from tafelmusik import document
+async def test_comment_notification_over_wire(server):
+    """Comment added by browser peer arrives via Yjs sync and triggers notification."""
+    mock_session = MockSession()
 
     async with make_state(server) as state:
-        conn = await state.connect("mixed-test")
+        state.session = mock_session
+        conn = await state.connect("wire-comment-test")
 
-        # Claude writes first
-        document.replace_all(conn.text, "## Draft\n\nClaude's content.\n", author=authors.CLAUDE)
-        await asyncio.sleep(3.0)
-        assert len(conn.pending_notifications) == 0
+        # Claude writes content the browser peer will comment on
+        conn.text += "The quick brown fox jumps over the lazy dog."
+        await asyncio.sleep(0.5)
 
-        # Browser edits
-        async with connect_peer(server, "mixed-test") as browser:
-            browser += "\nSameer added this."
-            await asyncio.sleep(0.5)
+        # Browser peer connects, syncs, then adds a comment via its own Doc
+        async with connect_peer(server, "wire-comment-test") as browser_text:
+            # Get the browser's synced Doc and comments Map
+            browser_doc = browser_text.doc
+            browser_comments = browser_doc.get("comments", type=Map)
 
-        # Wait for debounce
-        await asyncio.sleep(3.0)
-        assert len(conn.pending_notifications) > 0
+            with browser_doc.transaction():
+                c = Map()
+                browser_comments["browser-c1"] = c
+                c["author"] = "sameer"
+                c["quote"] = "brown fox"
+                c["body"] = "change to red fox"
+                c["resolved"] = False
+                c["created"] = "2026-03-30T22:00:00Z"
+
+            # Let sync propagate
+            await asyncio.sleep(1.0)
+
+        # Wait for consumer debounce + margin
+        await asyncio.sleep(1.5)
+
+        # MCP server should have received the comment via wire sync
+        assert len(mock_session.messages) > 0
+        notification = mock_session.messages[0].message.root
+        assert notification.method == "notifications/claude/channel"
+        assert "sameer" in notification.params["content"]
+        assert "brown fox" in notification.params["content"]
+        assert "change to red fox" in notification.params["content"]
 
 
-async def test_consumer_debounces_and_diffs(server):
-    """The change consumer debounces rapid edits and produces section-level diffs."""
-    from tafelmusik import document
+async def test_comment_consumer_debounces(server):
+    """Multiple comments within debounce window are batched then sent individually."""
+    mock_session = MockSession()
 
     async with make_state(server) as state:
+        state.session = mock_session
         conn = await state.connect("debounce-test")
+        conn.text += "Hello world foo bar"
 
-        # Claude writes initial content with sections
-        document.replace_all(
-            conn.text,
-            "## API\n\nOriginal API docs.\n\n## Usage\n\nUsage text.\n",
-            author=authors.CLAUDE,
-        )
-        await asyncio.sleep(0.5)
-        assert conn.change_queue.empty()  # Claude's edit not queued
+        # Rapid-fire 3 comments within debounce window
+        for i in range(3):
+            with conn.doc.transaction():
+                c = Map()
+                conn.comments_map[f"sameer-{i}"] = c
+                c["author"] = "sameer"
+                c["quote"] = ["Hello", "world", "foo"][i]
+                c["body"] = f"comment {i}"
+                c["resolved"] = False
 
-        # Browser edits the API section
-        async with connect_peer(server, "debounce-test") as browser:
-            # Find and replace the API section content
-            content = str(browser)
-            api_end = content.index("## Usage")
-            del browser[0:api_end]
-            browser.insert(0, "## API\n\nBrowser rewrote API.\n\n")
-            await asyncio.sleep(0.5)
+        # Wait for consumer debounce (0.5s) + margin
+        await asyncio.sleep(1.5)
 
-        # Wait for debounce (2s default) + margin
-        await asyncio.sleep(3.0)
-
-        # Consumer should have processed the change into pending_notifications
-        assert len(conn.pending_notifications) > 0
-        changes = conn.pending_notifications[0]
-        headings = [h for h, _ in changes]
-        assert "## API" in headings
-
-
-async def test_consumer_coalesces_rapid_edits(server):
-    """Multiple rapid edits within the debounce window produce one notification."""
-    from tafelmusik import document
-
-    async with make_state(server) as state:
-        conn = await state.connect("coalesce-test")
-
-        document.replace_all(
-            conn.text,
-            "## Notes\n\nOriginal notes.\n",
-            author=authors.CLAUDE,
-        )
-        await asyncio.sleep(0.5)
-
-        # Browser sends 5 rapid edits (within debounce window)
-        async with connect_peer(server, "coalesce-test") as browser:
-            for i in range(5):
-                browser += f"\nEdit {i}"
-                await asyncio.sleep(0.1)
-            await asyncio.sleep(0.3)
-
-        # Wait for debounce
-        await asyncio.sleep(3.0)
-
-        # Should produce exactly 1 notification, not 5
-        assert len(conn.pending_notifications) == 1
+        # All 3 should have been sent (batched into one debounce window)
+        assert len(mock_session.messages) == 3
 
 
 # --- TCP partition proxy for keepalive integration test ---
@@ -653,79 +667,75 @@ class MockSession:
 async def test_send_channel_notification_format():
     """_send_channel_notification sends correctly shaped JSONRPCNotification."""
     session = MockSession()
-    changes = [("## API", "modified"), ("## New", "added")]
 
-    await _send_channel_notification(session, "test-room", changes)
+    await _send_channel_notification(
+        session,
+        "Comment on 'test-room' by sameer:\n> \"Hello\"\nfix this",
+        meta={"room": "test-room", "type": "comment"},
+    )
 
     assert len(session.messages) == 1
     msg = session.messages[0]
     notification = msg.message.root
     assert notification.method == "notifications/claude/channel"
-    assert "test-room" in notification.params["content"]
-    assert "Modified section: ## API" in notification.params["content"]
-    assert "Added section: ## New" in notification.params["content"]
+    assert "sameer" in notification.params["content"]
+    assert "Hello" in notification.params["content"]
     assert notification.params["meta"]["room"] == "test-room"
+    assert notification.params["meta"]["type"] == "comment"
 
 
-async def test_channel_notification_on_remote_edit(server):
-    """Browser edit triggers channel notification when session is captured."""
-    from tafelmusik import document
-
+async def test_comment_notification_sent_to_session(server):
+    """New comment triggers channel notification when session is captured."""
     mock_session = MockSession()
 
     async with make_state(server) as state:
         state.session = mock_session
+        conn = await state.connect("comment-notify-test")
+        conn.text += "Hello world"
 
-        conn = await state.connect("channel-notify-test")
+        assert len(mock_session.messages) == 0
 
-        # Claude writes initial content
-        document.replace_all(
-            conn.text,
-            "## Intro\n\nOriginal.\n\n## Details\n\nSome details.\n",
-            author=authors.CLAUDE,
-        )
-        await asyncio.sleep(0.5)
-        assert len(mock_session.messages) == 0  # Claude's edit: no notification
+        # Simulate browser comment
+        with conn.doc.transaction():
+            c = Map()
+            conn.comments_map["sameer-1"] = c
+            c["author"] = "sameer"
+            c["quote"] = "Hello"
+            c["body"] = "fix this"
+            c["resolved"] = False
 
-        # Browser edits the Details section
-        async with connect_peer(server, "channel-notify-test") as browser:
-            content = str(browser)
-            details_start = content.index("## Details")
-            del browser[details_start:]
-            browser.insert(details_start, "## Details\n\nSameer rewrote this.\n")
-            await asyncio.sleep(0.5)
+        # Wait for consumer debounce (0.5s) + margin
+        await asyncio.sleep(1.5)
 
-        # Wait for debounce (2s) + margin
-        await asyncio.sleep(3.0)
-
-        # Channel notification should have been sent
         assert len(mock_session.messages) > 0
         notification = mock_session.messages[0].message.root
         assert notification.method == "notifications/claude/channel"
-        assert "channel-notify-test" in notification.params["content"]
+        assert "sameer" in notification.params["content"]
+        assert "Hello" in notification.params["content"]
+        assert "fix this" in notification.params["content"]
+        assert notification.params["meta"]["room"] == "comment-notify-test"
 
 
-async def test_no_channel_notification_without_session(server):
-    """Without a captured session, changes go to pending_notifications only."""
-    from tafelmusik import document
-
+async def test_no_comment_notification_without_session(server):
+    """Without a captured session, comments are gracefully skipped — no crash."""
     async with make_state(server) as state:
         # Don't set state.session — leave it None
         conn = await state.connect("no-session-test")
+        conn.text += "Hello world"
 
-        document.replace_all(conn.text, "## Test\n\nOriginal.\n", author=authors.CLAUDE)
-        await asyncio.sleep(0.5)
+        with conn.doc.transaction():
+            c = Map()
+            conn.comments_map["sameer-1"] = c
+            c["author"] = "sameer"
+            c["quote"] = "Hello"
+            c["body"] = "fix this"
+            c["resolved"] = False
 
-        # Browser edits
-        async with connect_peer(server, "no-session-test") as browser:
-            browser += "\nBrowser edit"
-            await asyncio.sleep(0.5)
+        # Wait for consumer
+        await asyncio.sleep(1.5)
 
-        await asyncio.sleep(3.0)
-
-        # pending_notifications should be populated (existing behaviour)
-        assert len(conn.pending_notifications) > 0
-        # No crash — graceful fallback
+        # No crash — graceful handling (logged, not sent)
+        assert conn._comment_queue.empty()
 
 
 # --- Patch mode tests ---
@@ -804,11 +814,7 @@ async def test_patch_error_no_match_via_mcp(server):
 
 async def test_room_poller_discovers_new_room(server):
     """Room poller connects to a room created by a browser client, without any tool call."""
-    mock_session = MockSession()
-
     async with make_state(server, poll_interval=0.5) as state:
-        state.session = mock_session
-
         # No rooms connected yet
         assert len(state.rooms) == 0
 
@@ -824,16 +830,6 @@ async def test_room_poller_discovers_new_room(server):
             assert "poller-discovery-test" in state.rooms
             conn = state.rooms["poller-discovery-test"]
             assert "Hello from browser" in str(conn.text)
-
-            # Now browser edits — observer should fire notification
-            browser += "\nAnother edit from Sameer."
-            await asyncio.sleep(0.5)
-
-        # Wait for debounce (2s) + margin
-        await asyncio.sleep(3.0)
-
-        # Channel notification should have been sent for the browser edit
-        assert len(conn.pending_notifications) > 0 or len(mock_session.messages) > 0
 
 
 async def test_room_poller_survives_server_down():

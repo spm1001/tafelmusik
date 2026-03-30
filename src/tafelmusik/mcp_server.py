@@ -167,15 +167,16 @@ async def _sync_loop(
         tg.cancel_scope.cancel()
 
 
-# --- Change observer: debounce + section diff ---
+# --- Channel notifications ---
 
 
 async def _send_channel_notification(
     session: ServerSession,
-    room: str,
-    changes: list[tuple[str, str]],
+    content: str,
+    *,
+    meta: dict | None = None,
 ) -> None:
-    """Send a channel notification to Claude Code with section-level diffs.
+    """Send a channel notification to Claude Code.
 
     Uses the low-level ServerSession.send_message() to send a custom
     JSONRPCNotification — the typed send_notification() API doesn't support
@@ -188,71 +189,70 @@ async def _send_channel_notification(
         "ServerSession.send_message() not found — MCP SDK API may have changed"
     )
 
-    summary_parts = []
-    for heading, kind in changes:
-        if kind == "modified":
-            summary_parts.append(f"Modified section: {heading}")
-        elif kind == "added":
-            summary_parts.append(f"Added section: {heading}")
-        elif kind == "removed":
-            summary_parts.append(f"Removed section: {heading}")
-    content = f"Document '{room}' edited by Sameer:\n" + "\n".join(summary_parts)
-
     notification = JSONRPCNotification(
         jsonrpc="2.0",
         method="notifications/claude/channel",
-        params={"content": content, "meta": {"room": room}},
+        params={"content": content, "meta": meta or {}},
     )
     msg = SessionMessage(message=JSONRPCMessage(notification))
     await session.send_message(msg)
 
 
-async def _change_consumer(
+async def _comment_consumer(
     conn: RoomConnection,
     room: str,
-    debounce: float = 2.0,
+    debounce: float = 0.5,
 ) -> None:
-    """Consume change events, debounce, and produce section-level diffs.
+    """Consume comment events, debounce, and send notifications.
 
-    Waits for silence (no new changes for ``debounce`` seconds) before
-    processing. Accumulates old→new across rapid edits so the diff
-    reflects the full change, not each keystroke.
-
-    When a session is available, sends channel notifications to Claude Code.
-    Falls back to pending_notifications list when no session is captured yet.
+    Comments are discrete events (not rapid-fire keystroke streams), so
+    debounce is shorter than the old doc-change observer (0.5s vs 2s).
+    Multiple comments within the debounce window are sent individually.
     """
     while True:
-        # Wait for first change
-        first_old, _ = await conn.change_queue.get()
-        latest_new = None
+        first = await conn._comment_queue.get()
+        events = [first]
 
-        # Drain additional changes within the debounce window
+        # Drain additional comments within the debounce window
         while True:
             try:
-                _, latest_new_candidate = await asyncio.wait_for(
-                    conn.change_queue.get(), timeout=debounce
+                more = await asyncio.wait_for(
+                    conn._comment_queue.get(), timeout=debounce
                 )
-                latest_new = latest_new_candidate
+                events.append(more)
             except TimeoutError:
                 break
 
-        # Use current text if no additional changes arrived
-        if latest_new is None:
-            latest_new = str(conn.text)
+        if conn._app_state is None or conn._app_state.session is None:
+            log.info(
+                "Room %s: %d comment(s) arrived but no MCP session yet",
+                room,
+                len(events),
+            )
+            continue
 
-        changes = document.diff_sections(first_old, latest_new)
-        if changes:
-            log.info("Room %s: remote edit — %s", room, changes)
-            conn.pending_notifications.append(changes)
-            if conn._app_state is not None and conn._app_state.session is not None:
-                try:
-                    await _send_channel_notification(conn._app_state.session, room, changes)
-                except Exception:
-                    log.warning(
-                        "Failed to send channel notification for room %s",
-                        room,
-                        exc_info=True,
-                    )
+        for event in events:
+            content = (
+                f"Comment on '{room}' by {event['author']}:\n"
+                f"> \"{event['quote']}\"\n"
+                f"{event['body']}"
+            )
+            try:
+                await _send_channel_notification(
+                    conn._app_state.session,
+                    content,
+                    meta={
+                        "room": room,
+                        "type": "comment",
+                        "comment_id": event["comment_id"],
+                    },
+                )
+            except Exception:
+                log.warning(
+                    "Failed to send comment notification for room %s",
+                    room,
+                    exc_info=True,
+                )
 
 
 # --- Connection management ---
@@ -262,34 +262,44 @@ async def _change_consumer(
 class RoomConnection:
     """A live connection to a single room on the ASGI server.
 
-    Holds the local Doc (with a Y.Text keyed "content") and events for
-    sync status and liveness. The sync loop runs in a background task that
-    also owns the WebSocket — they share the same asyncio Task to avoid
-    anyio cancel scope cross-task violations.
+    Holds the local Doc (with a Y.Text keyed "content" and Y.Map keyed
+    "comments") and events for sync status and liveness. The sync loop
+    runs in a background task that also owns the WebSocket — they share
+    the same asyncio Task to avoid anyio cancel scope cross-task violations.
 
-    The change_queue receives remote edits (origin != "claude") for
-    notification to the user. Populated by a synchronous text.observe()
-    callback; consumed by an async task that debounces and diffs.
+    Two observers:
+    - Text observer: updates _cached_content on every change (for drift
+      tracking in future). Does NOT send notifications.
+    - Comment observer: detects new comments from non-Claude authors,
+      queues them for notification via _comment_queue.
     """
 
     doc: Doc
     text: Text
+    comments_map: Map
     synced: Event
     dead: Event
     _task: asyncio.Task
-    change_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
-    pending_notifications: list = field(default_factory=list)
     _cached_content: str = ""
-    _consumer_task: asyncio.Task | None = None
-    _observe_subscription: Any = None
+    _observe_subscription: Any = None  # text observer (cache only)
+    _comment_observe_subscription: Any = None  # comment observer
+    _comment_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    _comment_consumer_task: asyncio.Task | None = None
     _app_state: Any = None  # AppState, set after construction (forward ref)
 
     async def close(self) -> None:
         if self._observe_subscription is not None:
             self.text.unobserve(self._observe_subscription)
             self._observe_subscription = None
-        if self._consumer_task and not self._consumer_task.done():
-            self._consumer_task.cancel()
+        if self._comment_observe_subscription is not None:
+            self.comments_map.unobserve(self._comment_observe_subscription)
+            self._comment_observe_subscription = None
+        if self._comment_consumer_task and not self._comment_consumer_task.done():
+            self._comment_consumer_task.cancel()
+            try:
+                await self._comment_consumer_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if not self._task.done():
             self._task.cancel()
         try:
@@ -335,6 +345,7 @@ class AppState:
 
         doc = Doc()
         doc["content"] = text = Text()
+        comments_map: Map = doc.get("comments", type=Map)
         synced = Event()
         dead = Event()
 
@@ -393,6 +404,7 @@ class AppState:
         conn = RoomConnection(
             doc=doc,
             text=text,
+            comments_map=comments_map,
             synced=synced,
             dead=dead,
             _task=task,
@@ -401,26 +413,57 @@ class AppState:
         )
 
         def _on_text_change(event, txn):
-            """Synchronous observe callback — queues remote edits only.
+            """Synchronous observe callback — maintains content cache.
 
-            Always updates the content cache (so diffs are accurate),
-            but only queues changes that weren't made by Claude.
+            Updates _cached_content on every change for drift tracking
+            (see tfm-nocaga). Does NOT send notifications — document-body
+            edits produce silence. Comments are the collaboration protocol.
 
             Wrapped in try/except because an unhandled exception here
             would propagate as an ExceptionGroup when the transaction
             commits, crashing the sync loop.
             """
             try:
-                old_content = conn._cached_content
-                new_content = str(text)
-                conn._cached_content = new_content
-                if txn.origin != authors.CLAUDE:
-                    conn.change_queue.put_nowait((old_content, new_content))
+                conn._cached_content = str(text)
             except Exception:
-                log.warning("Observer callback failed for room", exc_info=True)
+                log.warning("Text observer callback failed for room", exc_info=True)
+
+        def _on_comments_change(event, txn):
+            """Synchronous observe callback — queues new comments for notification.
+
+            Fires when the Y.Map 'comments' changes. Only queues new comments
+            (action == "add") from non-Claude authors. Edits to existing
+            comments (resolved, re-anchored) are ignored.
+
+            Wrapped in try/except because an unhandled exception here
+            would propagate as an ExceptionGroup when the transaction
+            commits, crashing the sync loop.
+            """
+            try:
+                if txn.origin == authors.CLAUDE:
+                    return
+                for key, change in event.keys.items():
+                    if change["action"] != "add":
+                        continue
+                    new_val = change["newValue"]
+                    if not isinstance(new_val, Map):
+                        continue
+                    conn._comment_queue.put_nowait(
+                        {
+                            "comment_id": key,
+                            "author": new_val.get("author", "unknown"),
+                            "quote": new_val.get("quote", ""),
+                            "body": new_val.get("body", ""),
+                        }
+                    )
+            except Exception:
+                log.warning("Comment observer callback failed for room", exc_info=True)
 
         conn._observe_subscription = text.observe(_on_text_change)
-        conn._consumer_task = asyncio.create_task(_change_consumer(conn, room))
+        conn._comment_observe_subscription = comments_map.observe(_on_comments_change)
+        conn._comment_consumer_task = asyncio.create_task(
+            _comment_consumer(conn, room)
+        )
 
         self.rooms[room] = conn
         return conn
