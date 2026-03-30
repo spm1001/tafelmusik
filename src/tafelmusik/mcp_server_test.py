@@ -16,7 +16,13 @@ from pycrdt import Doc, Map, Text, YMessageType, YSyncMessageType
 from tafelmusik import authors, comments
 from tafelmusik.asgi_server import create_app
 from tafelmusik.conftest import MockChannel, connect_peer, get_free_port
-from tafelmusik.mcp_server import AppState, _send_channel_notification, _sync_loop
+from tafelmusik.mcp_server import (
+    DRIFT_THRESHOLD,
+    AppState,
+    _compute_drift,
+    _send_channel_notification,
+    _sync_loop,
+)
 
 
 @pytest.fixture
@@ -51,6 +57,7 @@ async def make_state(port, poll_interval=None, **kwargs):
             client=client,
             server_url=f"ws://127.0.0.1:{port}",
             keepalive=None,  # No keepalive in tests
+            idle_timeout=kwargs.pop("idle_timeout", None),  # Explicit opt-in
             **kwargs,
         )
         if poll_interval is not None:
@@ -325,6 +332,7 @@ async def test_sync_timeout(tmp_path):
                 server_url=f"ws://127.0.0.1:{port}",
                 sync_timeout=1.0,
                 keepalive=None,
+                idle_timeout=None,
             )
             with pytest.raises(TimeoutError, match="timed out"):
                 await state.connect("test-room")
@@ -346,6 +354,7 @@ async def test_connect_fails_fast_when_server_down():
             server_url="ws://127.0.0.1:1",  # nothing listening
             sync_timeout=10.0,  # should NOT wait this long
             keepalive=None,
+            idle_timeout=None,
         )
         start = time.monotonic()
         with pytest.raises(ConnectionError, match="Connection to room"):
@@ -373,6 +382,7 @@ async def test_reconnect_after_server_restart(tmp_path):
             client=client,
             server_url=f"ws://127.0.0.1:{port}",
             keepalive=None,
+            idle_timeout=None,
         )
 
         conn1 = await state.connect("reconnect-test")
@@ -539,6 +549,204 @@ async def test_comment_consumer_debounces(server):
         assert len(mock_session.messages) == 3
 
 
+# --- Drift tracking tests (tfm-nocaga) ---
+
+
+async def test_drift_starts_at_zero(server):
+    """Immediately after sync, drift is zero (snapshot is current)."""
+    async with make_state(server) as state:
+        conn = await state.connect("drift-zero-test")
+        drift = _compute_drift(conn, "drift-zero-test")
+        assert drift == 0 or drift < 10  # minimal baseline noise
+
+
+async def test_drift_increases_on_remote_edit(server):
+    """Remote edits increase drift score."""
+    from tafelmusik import document
+
+    async with make_state(server) as state:
+        conn = await state.connect("drift-increase-test")
+
+        # Claude writes initial content (snapshotted at connect)
+        document.replace_all(conn.text, "Hello world", author=authors.CLAUDE)
+        await asyncio.sleep(0.3)
+
+        # Snapshot was taken at connect — Claude's edit increases drift
+        drift = _compute_drift(conn, "drift-increase-test")
+        assert drift > 0
+
+
+async def test_low_drift_comment_sends_comment_only(server):
+    """Comment on a doc Claude wrote (low drift) sends comment-only notification."""
+    mock_session = MockSession()
+
+    async with make_state(server) as state:
+        state.session = mock_session
+        conn = await state.connect("low-drift-test")
+
+        # Claude writes — take a fresh snapshot to keep drift low
+        conn.text += "Hello world"
+        from tafelmusik.mcp_server import _reset_snapshot
+        _reset_snapshot(conn, "low-drift-test")
+
+        drift = _compute_drift(conn, "low-drift-test")
+        assert drift <= DRIFT_THRESHOLD
+
+        # Browser adds comment
+        with conn.doc.transaction():
+            c = Map()
+            conn.comments_map["sameer-1"] = c
+            c["author"] = "sameer"
+            c["quote"] = "Hello"
+            c["body"] = "fix this"
+            c["resolved"] = False
+
+        await asyncio.sleep(1.5)
+
+        assert len(mock_session.messages) > 0
+        notification = mock_session.messages[0].message.root
+        assert notification.params["meta"]["type"] == "comment"
+        # Comment-only: no full doc content
+        assert "your model was stale" not in notification.params["content"]
+
+
+async def test_high_drift_comment_sends_full_doc(server):
+    """Comment on heavily-edited doc (high drift) includes full doc content."""
+    mock_session = MockSession()
+
+    async with make_state(server) as state:
+        state.session = mock_session
+        conn = await state.connect("high-drift-test")
+
+        # Write enough content that drift exceeds threshold
+        # DRIFT_THRESHOLD is 1024 bytes — write well over that
+        big_content = "# Big Document\n\n" + ("Lorem ipsum. " * 200) + "\n"
+        conn.text += big_content
+        await asyncio.sleep(0.3)
+
+        drift = _compute_drift(conn, "high-drift-test")
+        assert drift > DRIFT_THRESHOLD, f"Drift {drift} should exceed {DRIFT_THRESHOLD}"
+
+        # Browser adds comment
+        with conn.doc.transaction():
+            c = Map()
+            conn.comments_map["sameer-1"] = c
+            c["author"] = "sameer"
+            c["quote"] = "Lorem ipsum"
+            c["body"] = "too much filler"
+            c["resolved"] = False
+
+        await asyncio.sleep(1.5)
+
+        assert len(mock_session.messages) > 0
+        notification = mock_session.messages[0].message.root
+        assert notification.params["meta"]["type"] == "comment+resync"
+        assert "your model was stale" in notification.params["content"]
+        assert "Big Document" in notification.params["content"]
+
+
+async def test_high_drift_resets_snapshot_after_push(server):
+    """After a high-drift comment push, snapshot resets so next comment is low-drift."""
+    mock_session = MockSession()
+
+    async with make_state(server) as state:
+        state.session = mock_session
+        conn = await state.connect("snapshot-reset-test")
+
+        # Create high drift
+        conn.text += "x" * 2000
+        await asyncio.sleep(0.3)
+        assert _compute_drift(conn, "snapshot-reset-test") > DRIFT_THRESHOLD
+
+        # First comment triggers resync
+        with conn.doc.transaction():
+            c = Map()
+            conn.comments_map["sameer-1"] = c
+            c["author"] = "sameer"
+            c["quote"] = "xxx"
+            c["body"] = "first"
+            c["resolved"] = False
+
+        await asyncio.sleep(1.5)
+
+        # Drift should now be low (snapshot reset)
+        drift_after = _compute_drift(conn, "snapshot-reset-test")
+        assert drift_after <= DRIFT_THRESHOLD
+
+        # Second comment should be comment-only
+        with conn.doc.transaction():
+            c2 = Map()
+            conn.comments_map["sameer-2"] = c2
+            c2["author"] = "sameer"
+            c2["quote"] = "xxx"
+            c2["body"] = "second"
+            c2["resolved"] = False
+
+        await asyncio.sleep(1.5)
+
+        # Find the second notification
+        assert len(mock_session.messages) >= 2
+        second = mock_session.messages[-1].message.root
+        assert second.params["meta"]["type"] == "comment"
+
+
+async def test_idle_timer_pushes_resync(server):
+    """After idle_timeout with high drift, automatic resync is pushed."""
+    mock_session = MockSession()
+
+    async with make_state(server, idle_timeout=1.0) as state:
+        state.session = mock_session
+        conn = await state.connect("idle-resync-test")
+
+        # Create high drift via remote edit (non-Claude origin)
+        with conn.doc.transaction():
+            conn.text += "x" * 2000
+
+        await asyncio.sleep(0.3)
+        assert _compute_drift(conn, "idle-resync-test") > DRIFT_THRESHOLD
+
+        # Wait for idle timer (1.0s) + margin
+        await asyncio.sleep(2.0)
+
+        # Resync should have been pushed
+        assert len(mock_session.messages) > 0
+        notification = mock_session.messages[0].message.root
+        assert notification.params["meta"]["type"] == "resync"
+        assert "resync" in notification.params["content"]
+
+
+async def test_idle_timer_does_not_push_low_drift(server):
+    """Idle timer fires but drift is low — no push."""
+    mock_session = MockSession()
+
+    async with make_state(server, idle_timeout=1.0) as state:
+        state.session = mock_session
+        conn = await state.connect("idle-low-drift-test")
+
+        # Small remote edit (low drift)
+        with conn.doc.transaction():
+            conn.text += "tiny edit"
+
+        # Wait for idle timer + margin
+        await asyncio.sleep(2.0)
+
+        # No resync pushed (drift too low)
+        assert len(mock_session.messages) == 0
+
+
+async def test_inspect_doc_shows_drift(server):
+    """inspect_doc output includes drift score."""
+    async with make_state(server) as state:
+        conn = await state.connect("inspect-drift-test")
+        conn.text += "Hello world"
+        await asyncio.sleep(0.3)
+
+        # Call inspect through the connection (not the MCP tool)
+        drift = _compute_drift(conn, "inspect-drift-test")
+        assert isinstance(drift, int)
+        assert drift >= 0
+
+
 # --- TCP partition proxy for keepalive integration test ---
 
 
@@ -619,6 +827,7 @@ async def test_keepalive_detects_dead_connection(tmp_path):
                     client=client,
                     server_url=f"ws://127.0.0.1:{proxy_port}",
                     keepalive=0.5,
+                    idle_timeout=None,
                 )
 
                 # Connect and write through proxy
@@ -839,6 +1048,7 @@ async def test_room_poller_survives_server_down():
             client=client,
             server_url="ws://127.0.0.1:1",  # nothing listening
             keepalive=None,
+            idle_timeout=None,
         )
         await state.start_room_poller(interval=0.3)
 

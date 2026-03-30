@@ -49,6 +49,19 @@ from tafelmusik import authors, comments, document
 
 log = logging.getLogger(__name__)
 
+# Drift threshold in bytes of CRDT update data. When the binary diff between
+# the last-pushed state vector and the current Doc exceeds this, Claude's
+# mental model is considered stale and a full document push is triggered.
+# Conservative starting point — a few paragraphs of editing. Tune based on
+# real usage: too low = wasted resync tokens, too high = stale model + failed patches.
+DRIFT_THRESHOLD = 1024
+
+# Seconds of no edits before a high-drift resync is pushed automatically.
+# Detects the "major surgery without commenting" case — Sameer restructures
+# heavily, doesn't comment, walks away. Separate from the comment debouncer
+# (different timescale, different purpose).
+IDLE_TIMEOUT = 30.0
+
 
 def _ws_to_http(url: str) -> str:
     """Convert ws:// or wss:// URL to http:// or https:// for httpx."""
@@ -198,16 +211,60 @@ async def _send_channel_notification(
     await session.send_message(msg)
 
 
+def _compute_drift(conn: RoomConnection, room: str) -> int:
+    """Compute drift score: bytes of CRDT updates since last snapshot."""
+    if conn._app_state is None:
+        return 0
+    snapshot = conn._app_state.room_snapshots.get(room, b"\x00")
+    return len(conn.doc.get_update(snapshot))
+
+
+def _reset_snapshot(conn: RoomConnection, room: str) -> None:
+    """Capture current state vector as the new baseline for drift."""
+    if conn._app_state is not None:
+        conn._app_state.room_snapshots[room] = conn.doc.get_state()
+
+
+async def _push_resync(conn: RoomConnection, room: str) -> None:
+    """Push full document content as a resync notification if drift is high.
+
+    Called by the idle timer after IDLE_TIMEOUT seconds of no remote edits.
+    Checks drift before pushing — if edits were minor, no push needed.
+    """
+    if conn._app_state is None or conn._app_state.session is None:
+        return
+    drift = _compute_drift(conn, room)
+    if drift <= DRIFT_THRESHOLD:
+        return
+    content = (
+        f"Document '{room}' resync — significant edits since last push:\n\n"
+        + str(conn.text)
+    )
+    try:
+        await _send_channel_notification(
+            conn._app_state.session,
+            content,
+            meta={"room": room, "type": "resync", "drift": drift},
+        )
+        _reset_snapshot(conn, room)
+        log.info("Room %s: resync pushed (idle after high drift, %dB)", room, drift)
+    except Exception:
+        log.warning("Failed to send resync for room %s", room, exc_info=True)
+
+
 async def _comment_consumer(
     conn: RoomConnection,
     room: str,
     debounce: float = 0.5,
 ) -> None:
-    """Consume comment events, debounce, and send notifications.
+    """Consume comment events, debounce, and send drift-aware notifications.
 
     Comments are discrete events (not rapid-fire keystroke streams), so
     debounce is shorter than the old doc-change observer (0.5s vs 2s).
-    Multiple comments within the debounce window are sent individually.
+
+    When drift is high (model stale from Sameer's edits), the notification
+    includes the full document content alongside the comment. When drift is
+    low (Claude already knows the doc), comment-only is sent.
     """
     while True:
         first = await conn._comment_queue.get()
@@ -231,20 +288,34 @@ async def _comment_consumer(
             )
             continue
 
+        drift = _compute_drift(conn, room)
+        high_drift = drift > DRIFT_THRESHOLD
+
         for event in events:
-            content = (
+            comment_text = (
                 f"Comment on '{room}' by {event['author']}:\n"
                 f"> \"{event['quote']}\"\n"
                 f"{event['body']}"
             )
+            if high_drift:
+                content = (
+                    comment_text
+                    + "\n\n[Full document content follows — your model was stale]\n\n"
+                    + str(conn.text)
+                )
+                ntype = "comment+resync"
+            else:
+                content = comment_text
+                ntype = "comment"
             try:
                 await _send_channel_notification(
                     conn._app_state.session,
                     content,
                     meta={
                         "room": room,
-                        "type": "comment",
+                        "type": ntype,
                         "comment_id": event["comment_id"],
+                        "drift": drift,
                     },
                 )
             except Exception:
@@ -253,6 +324,10 @@ async def _comment_consumer(
                     room,
                     exc_info=True,
                 )
+
+        # Reset snapshot after pushing (whether comment-only or resync)
+        if high_drift:
+            _reset_snapshot(conn, room)
 
 
 # --- Connection management ---
@@ -268,10 +343,13 @@ class RoomConnection:
     the same asyncio Task to avoid anyio cancel scope cross-task violations.
 
     Two observers:
-    - Text observer: updates _cached_content on every change (for drift
-      tracking in future). Does NOT send notifications.
+    - Text observer: updates _cached_content, computes drift, resets idle
+      timer on every remote change. Does NOT send notifications directly.
     - Comment observer: detects new comments from non-Claude authors,
       queues them for notification via _comment_queue.
+
+    Idle timer: fires after IDLE_TIMEOUT seconds of no remote edits.
+    If drift is high, pushes a full resync.
     """
 
     doc: Doc
@@ -281,13 +359,17 @@ class RoomConnection:
     dead: Event
     _task: asyncio.Task
     _cached_content: str = ""
-    _observe_subscription: Any = None  # text observer (cache only)
+    _observe_subscription: Any = None  # text observer (cache + drift)
     _comment_observe_subscription: Any = None  # comment observer
     _comment_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     _comment_consumer_task: asyncio.Task | None = None
+    _idle_timer: asyncio.TimerHandle | None = None
     _app_state: Any = None  # AppState, set after construction (forward ref)
 
     async def close(self) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
         if self._observe_subscription is not None:
             self.text.unobserve(self._observe_subscription)
             self._observe_subscription = None
@@ -320,8 +402,10 @@ class AppState:
     client: httpx.AsyncClient
     server_url: str
     rooms: dict[str, RoomConnection] = field(default_factory=dict)
+    room_snapshots: dict[str, bytes] = field(default_factory=dict)
     sync_timeout: float = 10.0
     keepalive: float | None = 60.0
+    idle_timeout: float | None = IDLE_TIMEOUT
     session: ServerSession | None = None
     docs_dir: Path | None = None
 
@@ -413,11 +497,15 @@ class AppState:
         )
 
         def _on_text_change(event, txn):
-            """Synchronous observe callback — maintains content cache.
+            """Synchronous observe callback — cache, drift, idle timer.
 
-            Updates _cached_content on every change for drift tracking
-            (see tfm-nocaga). Does NOT send notifications — document-body
-            edits produce silence. Comments are the collaboration protocol.
+            Updates _cached_content on every change. On remote edits
+            (non-Claude), resets the idle timer. When the idle timer fires
+            (no edits for IDLE_TIMEOUT), _push_resync runs if drift is high.
+
+            Does NOT send notifications directly — comments are the
+            collaboration protocol. The idle timer handles the "major
+            surgery without commenting" case.
 
             Wrapped in try/except because an unhandled exception here
             would propagate as an ExceptionGroup when the transaction
@@ -425,6 +513,15 @@ class AppState:
             """
             try:
                 conn._cached_content = str(text)
+                if txn.origin != authors.CLAUDE and self.idle_timeout is not None:
+                    # Reset idle timer on each remote edit
+                    if conn._idle_timer is not None:
+                        conn._idle_timer.cancel()
+                    loop = asyncio.get_event_loop()
+                    conn._idle_timer = loop.call_later(
+                        self.idle_timeout,
+                        lambda: asyncio.ensure_future(_push_resync(conn, room)),
+                    )
             except Exception:
                 log.warning("Text observer callback failed for room", exc_info=True)
 
@@ -464,6 +561,22 @@ class AppState:
         conn._comment_consumer_task = asyncio.create_task(
             _comment_consumer(conn, room)
         )
+
+        # Snapshot state after initial sync — baseline for drift tracking
+        _reset_snapshot(conn, room)
+
+        # Push initial context if room has content and session is available
+        doc_content = str(text)
+        if doc_content and self.session is not None:
+            try:
+                await _send_channel_notification(
+                    self.session,
+                    f"Document '{room}' — initial content:\n\n{doc_content}",
+                    meta={"room": room, "type": "initial"},
+                )
+                log.info("Room %s: initial context pushed (%d chars)", room, len(doc_content))
+            except Exception:
+                log.warning("Failed to push initial context for room %s", room, exc_info=True)
 
         self.rooms[room] = conn
         return conn
@@ -827,21 +940,29 @@ async def flush_doc(room: str, ctx: Context) -> str:
 
 @mcp.tool()
 async def inspect_doc(room: str, ctx: Context) -> str:
-    """Inspect a document's Y.Text with formatting attributes.
+    """Inspect a document's Y.Text with formatting attributes and drift score.
 
     Returns the text as a sequence of attributed chunks — each chunk is a
     run of text sharing the same attrs (e.g. author). This reveals the
     CRDT layer that str(text) hides: who wrote what, and whether any
     unexpected formatting attributes are present.
 
+    Also shows the drift score: bytes of CRDT updates since the last snapshot.
+    High drift (>{DRIFT_THRESHOLD}B) means Claude's mental model may be stale.
+
     Args:
         room: Document room name
     """
     state = _get_state(ctx)
     conn = await state.connect(room)
+
+    drift = _compute_drift(conn, room)
+    drift_status = "stale" if drift > DRIFT_THRESHOLD else "fresh"
+    header = f"Document '{room}' — drift: {drift}B ({drift_status}, threshold: {DRIFT_THRESHOLD}B)"
+
     chunks = conn.text.diff()
     if not chunks:
-        return f"(Document '{room}' is empty)"
+        return f"{header}\n(empty)"
     lines = []
     for content, attrs in chunks:
         preview = repr(content) if len(content) <= 80 else repr(content[:77] + "...")
@@ -849,7 +970,7 @@ async def inspect_doc(room: str, ctx: Context) -> str:
             lines.append(f"  {preview}  attrs={attrs}")
         else:
             lines.append(f"  {preview}")
-    return f"Document '{room}' — {len(chunks)} chunk(s):\n" + "\n".join(lines)
+    return f"{header}\n{len(chunks)} chunk(s):\n" + "\n".join(lines)
 
 
 @mcp.tool()
