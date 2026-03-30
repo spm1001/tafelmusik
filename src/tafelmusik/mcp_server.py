@@ -33,7 +33,10 @@ from mcp.server.session import ServerSession
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
 from pycrdt import (
+    Assoc,
     Doc,
+    Map,
+    StickyIndex,
     Text,
     YMessageType,
     YSyncMessageType,
@@ -638,6 +641,102 @@ async def inspect_doc(room: str, ctx: Context) -> str:
         else:
             lines.append(f"  {preview}")
     return f"Document '{room}' — {len(chunks)} chunk(s):\n" + "\n".join(lines)
+
+
+@mcp.tool()
+async def add_comment(room: str, quote: str, body: str, ctx: Context) -> str:
+    """Add a comment anchored to specific text in a document.
+
+    Finds the quote text in the document, creates anchors at that position,
+    and stores the comment in the Y.Map 'comments'. The comment appears in
+    the browser's comments pane with author='claude'.
+
+    Args:
+        room: Document room name
+        quote: Exact text to comment on (must exist in the document)
+        body: The comment text
+    """
+    state = _get_state(ctx)
+    conn = await state.connect(room)
+
+    doc_text = str(conn.text)
+    idx = doc_text.find(quote)
+    if idx == -1:
+        return f"Quote not found in document: {quote!r}"
+
+    comments_map: Map = conn.doc.get("comments", type=Map)
+
+    # Create anchors using StickyIndex — serializes as JSON compatible with
+    # Yjs RelativePosition (same item {client, clock} + assoc structure).
+    start_si = StickyIndex.new(conn.text, idx, assoc=Assoc.AFTER)
+    end_si = StickyIndex.new(conn.text, idx + len(quote), assoc=Assoc.BEFORE)
+
+    import json
+    from datetime import datetime, timezone
+
+    comment_id = f"claude-{int(time.time() * 1000)}"
+
+    with conn.doc.transaction(origin=authors.CLAUDE):
+        comment = Map()
+        comments_map[comment_id] = comment
+        comment["anchorStart"] = json.dumps(start_si.to_json())
+        comment["anchorEnd"] = json.dumps(end_si.to_json())
+        comment["anchor"] = json.dumps(start_si.to_json())
+        comment["quote"] = quote
+        comment["author"] = "claude"
+        comment["body"] = body
+        comment["resolved"] = False
+        comment["created"] = datetime.now(timezone.utc).isoformat()
+
+    return f"Comment added on '{room}': {body!r} anchored to {quote!r}"
+
+
+@mcp.tool()
+async def list_comments(room: str, ctx: Context) -> str:
+    """List all comments on a document.
+
+    Returns comments from the Y.Map 'comments', sorted by document position.
+    Each comment shows: author, quoted text, comment body, and resolved status.
+
+    Args:
+        room: Document room name
+    """
+    state = _get_state(ctx)
+    conn = await state.connect(room)
+
+    comments: Map = conn.doc.get("comments", type=Map)
+    if not comments:
+        return f"No comments on '{room}'"
+
+    entries = []
+    for comment_id in comments:
+        comment = comments[comment_id]
+        if not isinstance(comment, Map):
+            continue
+        entries.append({
+            "id": comment_id,
+            "author": comment.get("author", "unknown"),
+            "quote": comment.get("quote", ""),
+            "body": comment.get("body", ""),
+            "resolved": comment.get("resolved", False),
+            "created": comment.get("created", ""),
+        })
+
+    if not entries:
+        return f"No comments on '{room}'"
+
+    # Sort by created time
+    entries.sort(key=lambda e: e["created"])
+
+    lines = [f"Comments on '{room}' — {len(entries)} comment(s):\n"]
+    for e in entries:
+        status = " [resolved]" if e["resolved"] else ""
+        lines.append(f"  {e['author']}{status}")
+        lines.append(f"  > {e['quote']}")
+        lines.append(f"  {e['body']}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

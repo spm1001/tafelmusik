@@ -3,48 +3,62 @@
 <head>
   <title>Tafelmusik</title>
   <style>
-    body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 1rem; background: #fff; }
-    h1 { font-size: 1.2rem; color: #666; margin: 0; }
-    .editor-wrap { display: flex; gap: 1rem; }
-    .cm-editor { border: 1px solid #ddd; border-radius: 4px; height: calc(100vh - 80px); }
-    .cm-editor .cm-scroller { overflow: auto; }
-    .cm-editor .cm-content { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; }
-    .preview { flex: 1; border: 1px solid #ddd; border-radius: 4px; padding: 1rem; overflow: auto; height: calc(100vh - 80px); box-sizing: border-box; font-size: 15px; line-height: 1.6; }
-    .preview table { border-collapse: collapse; margin: 1em 0; }
-    .preview th, .preview td { border: 1px solid #ddd; padding: 6px 12px; text-align: left; }
-    .preview th { background: #f5f5f5; }
-    .preview blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1em; color: #666; }
-    .preview code { background: #f5f5f5; padding: 2px 4px; border-radius: 3px; font-size: 0.9em; }
-    .preview pre { background: #1e1e1e; color: #d4d4d4; padding: 1em; border-radius: 4px; overflow-x: auto; }
-    .preview pre code { background: none; color: inherit; padding: 0; }
-    .preview hr { border: none; border-top: 1px solid #ddd; }
-    .pane { flex: 1; min-width: 0; }
-    .header { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem; }
-    .tabs { display: flex; gap: 0.5rem; }
-    .tabs button { padding: 4px 12px; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; cursor: pointer; font-size: 0.85rem; }
-    .tabs button.active { background: #333; color: #fff; border-color: #333; }
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 0; background: #fff; }
+    .status-bar { position: fixed; top: 0.5rem; right: 0.5rem; z-index: 10; display: flex; align-items: center; gap: 0.5rem; }
     .status { font-size: 0.75rem; padding: 2px 8px; border-radius: 8px; }
     .status.connected { color: #22863a; background: #dcffe4; }
     .status.connecting { color: #b08800; background: #fff8c5; }
     .status.disconnected { color: #cb2431; background: #ffdce0; }
-    #room-name { font-size: 0.85rem; color: #999; }
+    #room-name { font-size: 0.75rem; color: #999; }
+
+    /* Split layout — each pane scrolls independently */
+    .editor-layout { display: flex; height: 100vh; }
+    #editor-pane { flex: 1; min-width: 0; overflow: hidden; }
+    #comments-pane { flex: 1; min-width: 0; border-left: 1px solid #eee; overflow-y: auto; background: #fafafa; display: flex; flex-direction: column; }
+    #comments-list { flex: 1; overflow-y: auto; padding: 1rem; padding-bottom: 50vh; }
+    .cm-editor { border: none; height: 100%; }
+    .cm-editor .cm-scroller { overflow: auto; }
+    .cm-editor .cm-content { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; padding: 1rem; }
+
+    /* Comment highlight in editor */
+    .cm-comment-highlight { background: rgba(255, 212, 0, 0.15); border-bottom: 2px solid #ffd400; }
+
+    /* Comment cards */
+    .comment-card { margin-bottom: 0.75rem; padding: 0.75rem; background: #fff; border: 1px solid #e0e0e0; border-left: 3px solid #e0e0e0; border-radius: 6px; font-size: 0.85rem; line-height: 1.5; cursor: pointer; }
+    .comment-card.author-sameer { border-left-color: #4a9eff; }
+    .comment-card.author-claude { border-left-color: #d4a574; }
+    .comment-card:hover { border-color: #ccc; }
+    .comment-card.active { border-color: #ffd400; box-shadow: 0 0 0 1px #ffd400; }
+    .comment-quote { color: #666; font-style: italic; border-left: 2px solid #ffd400; padding-left: 0.5rem; margin-bottom: 0.5rem; font-size: 0.8rem; white-space: pre-wrap; }
+    .comment-author { font-weight: 600; font-size: 0.75rem; color: #999; margin-bottom: 0.25rem; }
+    .comment-body { color: #333; }
+    .comment-resolve { margin-top: 0.5rem; padding: 3px 10px; border: 1px solid #ddd; border-radius: 4px; background: #fff; cursor: pointer; font-size: 0.75rem; color: #666; }
+    .comment-resolve:hover { background: #f5f5f5; }
+
+    /* Compose card (inline in flow) */
+    .compose-card { margin-bottom: 0.75rem; padding: 0.75rem; background: #fff; border: 1px solid #ffd400; border-radius: 6px; }
+    .compose-card .comment-quote { margin-bottom: 0.5rem; }
+    .compose-editor .cm-editor { border: 1px solid #ddd; border-radius: 4px; min-height: 48px; max-height: 150px; height: auto; }
+    .compose-editor .cm-editor.cm-focused { border-color: #ffd400; }
+    .compose-editor .cm-scroller { overflow: auto; }
+    .compose-editor .cm-content { padding: 0.5rem; font-family: -apple-system, system-ui, sans-serif; font-size: 0.85rem; }
+    .compose-editor .cm-gutters { display: none; }
+    .compose-editor .cm-activeLine { background: transparent; }
+    .compose-hint { font-size: 0.7rem; color: #999; margin-top: 0.4rem; text-align: right; }
+
+    /* Empty state */
+    .comments-empty { color: #999; font-size: 0.85rem; text-align: center; padding: 2rem 1rem; }
   </style>
 </head>
 <body>
-  <div style="max-width: 1800px; margin: 0 auto;">
-    <div class="header">
-      <h1>Tafelmusik</h1>
-      <span id="room-name"></span>
-      <span id="connection-status" class="status connecting">connecting</span>
-      <div class="tabs">
-        <button id="btn-edit" class="active" onclick="setMode('edit')">Edit</button>
-        <button id="btn-split" onclick="setMode('split')">Split</button>
-        <button id="btn-preview" onclick="setMode('preview')">Preview</button>
-      </div>
-    </div>
-    <div class="editor-wrap" id="container">
-      <div class="pane" id="editor-pane"></div>
-      <div class="preview pane" id="preview-pane" style="display:none;"></div>
+  <div class="status-bar">
+    <span id="room-name"></span>
+    <span id="connection-status" class="status connecting">connecting</span>
+  </div>
+  <div class="editor-layout">
+    <div id="editor-pane"></div>
+    <div id="comments-pane">
+      <div id="comments-list"></div>
     </div>
   </div>
 

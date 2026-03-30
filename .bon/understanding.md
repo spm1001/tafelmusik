@@ -6,7 +6,15 @@ Two processes, one codebase: ASGI server (always-running, holds Y.Doc) and MCP s
 
 Neither the ASGI server nor the MCP server depends on `pycrdt-websocket`. The entire sync protocol — both server-side and client-side — uses only public pycrdt APIs: `create_sync_message`, `handle_sync_message`, `create_update_message`, `doc.events()`. The only pycrdt dependencies are `pycrdt` (core) and `pycrdt-store` (SQLiteYStore). This was a deliberate choice to eliminate version-pinning anxiety from private API coupling in a 24/7 server process.
 
+## The files-on-disk pivot
+
+The current architecture stores documents only as Yjs updates in SQLite — no .md files on disk. This creates a coupling that prevents editing documents with other tools, git-tracking content, or pointing Tafelmusik at an existing folder of markdown. The emerging direction: files on disk are truth, CRDT is the collaboration overlay. Room names would map to file paths, hydrate CRDT from file on open, flush back on save/disconnect. SQLite holds ephemeral session state (Yjs updates for real-time sync), but the durable artifact is the .md file. This would make `list_docs` = `ls *.md`, enable git workflows, and let Claude edit files directly. Many of the UI outcomes (naming, listing, lifecycle — tfm-dibuca) simplify when documents are files. The room poller (tfm-ditufu) is a pragmatic stopgap in this framing, not the final answer for room discovery.
+
+## Comments: inline reactions, not editorial workflow
+
 Comments use point+quote anchoring: a single StickyIndex marks where the comment is, a stored quote string says what text it refers to. This is more resilient than start/end ranges because `replace_section` (Claude's primary editing mode) destroys StickyIndex anchors by deleting their containing text. With point+quote, re-anchoring is a text search; with ranges, both endpoints collapse.
+
+The clearest articulation of why comments matter came during /close: Sameer wanted to react to specific parts of Claude's reflection but had to paste-and-interleave or use ambiguous number references. Comments aren't about code review or editorial workflow — they're about enabling inline reactions to specific text, from either party, without breaking the document flow. This reframes tfm-melemu: the UI affordance (a side pane linked to text selections) matters more than the backend (StickyIndex + Y.Map already exist). The dependency chain is: clean up the editor (tfm-kosotu) -> repurpose the split pane as a comments sidebar -> wire to the Y.Map backend (tfm-melemu).
 
 ## How Yjs persistence actually works
 
@@ -66,7 +74,7 @@ The `connect_peer()` test helper in `conftest.py` handles this correctly: it wra
 
 ## Debugging across library boundaries
 
-When N libraries interact and something breaks, bisect the layers before theorising. The approach that cracked the cancel scope bug: bare pycrdt write (works) → write with observer (works) → write with background `asyncio.create_task` (works) → write with Provider (crashes). Each step adds one layer; the failing step isolates the interaction. This took 5 minutes after 20 minutes of theorising about anyio task groups and event types found nothing. The lesson generalises: test each pair of libraries in isolation before reasoning about the whole stack.
+When N libraries interact and something breaks, bisect the layers before theorising. The approach that cracked the cancel scope bug: bare pycrdt write (works) -> write with observer (works) -> write with background `asyncio.create_task` (works) -> write with Provider (crashes). Each step adds one layer; the failing step isolates the interaction. This took 5 minutes after 20 minutes of theorising about anyio task groups and event types found nothing. The lesson generalises: test each pair of libraries in isolation before reasoning about the whole stack.
 
 ## Persistence landmine: pycrdt-store squashing
 
