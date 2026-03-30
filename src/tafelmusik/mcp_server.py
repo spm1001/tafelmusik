@@ -33,7 +33,7 @@ from httpx_ws import aconnect_ws
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage, JSONRPCNotification
+from mcp.types import InitializedNotification, JSONRPCMessage, JSONRPCNotification
 from pycrdt import (
     Assoc,
     Doc,
@@ -526,12 +526,37 @@ def _init_options_with_channel(**kwargs):
 
 mcp._mcp_server.create_initialization_options = _init_options_with_channel
 
+# Capture ServerSession on InitializedNotification — before any tool call.
+# This enables channel notifications immediately, so edits/comments in the
+# browser trigger alerts without needing a tool call first.
+#
+# Private API: Server._handle_message (mcp 1.26.0)
+# Validated: lowlevel/server.py — receives (message, session, lifespan_context)
+# for every message including notifications. InitializedNotification arrives
+# strictly before any tool/resource/prompt request.
+_original_handle_message = mcp._mcp_server._handle_message
+assert hasattr(mcp._mcp_server, "_handle_message"), (
+    "Server._handle_message not found — MCP SDK API may have changed"
+)
+
+
+async def _capture_session_on_init(message, session, lifespan_context, **kwargs):
+    if isinstance(message.root, InitializedNotification):
+        if lifespan_context is not None and hasattr(lifespan_context, "session"):
+            lifespan_context.session = session
+            log.info("Captured MCP session on initialization (before first tool call)")
+    return await _original_handle_message(message, session, lifespan_context, **kwargs)
+
+
+mcp._mcp_server._handle_message = _capture_session_on_init
+
 
 def _get_state(ctx: Context) -> AppState:
     state = ctx.request_context.lifespan_context
     if state.session is None:
+        # Fallback: capture on first tool call if init capture missed
         state.session = ctx.request_context.session
-        log.info("Captured MCP session for channel notifications")
+        log.info("Captured MCP session on first tool call (fallback)")
     return state
 
 
