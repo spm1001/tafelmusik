@@ -104,6 +104,10 @@ pycrdt-store 0.1.3 has a data-loss bug in SQLiteYStore.write() — the inline sq
 
 replace_section finds headings by exact text match, not by position. This matters because in a CRDT, positions shift as peers edit concurrently. Text matching is stable; index-based matching isn't. The section boundary algorithm (same-or-higher heading level) matches CommonMark's implicit section structure.
 
+## Multi-action choreography
+
+Bons capture what (--what) and why (--why) per action, but not the execution ordering between actions. This gap becomes dangerous when an outcome has actions with sequencing dependencies — calute Phase 2 requires four actions in strict order (becitu → semame → nocaga → napari) because swapping the observer before drift tracking is ready makes Claude completely deaf to major surgery. The --what fields are self-contained per action, but the constraint lives *between* them. The workaround is an implementation brief (`docs/calute-phase2-brief.md`) referenced from the outcome. This is convention, not structure — if a future Claude skips the brief, they'll implement in isolation and hit the dangerous partial state. Filed bon-tufihu in the bon repo for a proper --how mechanism. Any multi-action outcome with ordering dependencies needs this kind of choreography documentation.
+
 ## Token efficiency insight
 
 CRDTs are already more token-efficient than a file-based approach would be. The CRDT pushes diffs over the wire — adding a file layer on top would mean hauling full file content in and out of context. The drift threshold (how much CRDT state can diverge from the file before forcing a resync) is a Goldilocks problem: too low = wasted resync tokens, too high = wasted failed-edit tokens. Comments serve as turn signals rather than continuous notifications — comment events notify Claude, not every keystroke.

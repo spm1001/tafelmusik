@@ -35,10 +35,8 @@ from mcp.server.session import ServerSession
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
 from pycrdt import (
-    Assoc,
     Doc,
     Map,
-    StickyIndex,
     Text,
     YMessageType,
     YSyncMessageType,
@@ -605,7 +603,7 @@ async def edit_doc(
         doc_len = len(str(conn.text))
         affected = comments.collect_affected(conn.text, comments_map, 0, doc_len)
         document.replace_all(conn.text, content, author=authors.CLAUDE)
-        result = comments.reanchor(conn.text, comments_map, affected)
+        result = comments.reanchor(conn.text, comments_map, affected, author=authors.CLAUDE)
         suffix = _reanchor_summary(result)
         return f"Replaced all content in '{room}' ({len(content)} chars){suffix}"
     elif mode == "replace_section":
@@ -630,9 +628,12 @@ async def edit_doc(
                         affected,
                         search_start=new_bounds[0],
                         search_end=new_bounds[1],
+                        author=authors.CLAUDE,
                     )
                 else:
-                    result = comments.reanchor(conn.text, comments_map, affected)
+                    result = comments.reanchor(
+                        conn.text, comments_map, affected, author=authors.CLAUDE
+                    )
             else:
                 result = {"reanchored": [], "orphaned": []}
         except ValueError as e:
@@ -664,6 +665,7 @@ async def edit_doc(
                     affected,
                     search_start=patch_start,
                     search_end=max(search_end, patch_start + 1),
+                    author=authors.CLAUDE,
                 )
             else:
                 result = {"reanchored": [], "orphaned": []}
@@ -693,7 +695,7 @@ async def load_doc(room: str, markdown: str, ctx: Context) -> str:
     doc_len = len(str(conn.text))
     affected = comments.collect_affected(conn.text, comments_map, 0, doc_len)
     document.replace_all(conn.text, markdown, author=authors.CLAUDE)
-    result = comments.reanchor(conn.text, comments_map, affected)
+    result = comments.reanchor(conn.text, comments_map, affected, author=authors.CLAUDE)
     suffix = _reanchor_summary(result)
     return f"Loaded {len(markdown)} chars into '{room}'{suffix}"
 
@@ -750,11 +752,7 @@ async def flush_doc(room: str, ctx: Context) -> str:
 
     # Wipe comments
     comments_map: Map = conn.doc.get("comments", type=Map)
-    comment_keys = list(comments_map)
-    if comment_keys:
-        with conn.doc.transaction(origin=authors.CLAUDE):
-            for key in comment_keys:
-                del comments_map[key]
+    wiped = comments.clear_all(conn.doc, comments_map, author=authors.CLAUDE)
 
     # Git commit the file (only if docs_dir is inside a git repo)
     git_status = ""
@@ -780,7 +778,6 @@ async def flush_doc(room: str, ctx: Context) -> str:
     else:
         git_status = " No git repo found — skipped commit."
 
-    wiped = len(comment_keys)
     comment_note = f" {wiped} comment(s) cleared." if wiped else ""
     return f"Flushed {len(content)} chars to {md_path}.{comment_note}{git_status}"
 
@@ -827,36 +824,13 @@ async def add_comment(room: str, quote: str, body: str, ctx: Context) -> str:
     """
     state = _get_state(ctx)
     conn = await state.connect(room)
-
-    doc_text = str(conn.text)
-    idx = doc_text.find(quote)
-    if idx == -1:
-        return f"Quote not found in document: {quote!r}"
-
     comments_map: Map = conn.doc.get("comments", type=Map)
-
-    # Create anchors using StickyIndex — serializes as JSON compatible with
-    # Yjs RelativePosition (same item {client, clock} + assoc structure).
-    start_si = StickyIndex.new(conn.text, idx, assoc=Assoc.AFTER)
-    end_si = StickyIndex.new(conn.text, idx + len(quote), assoc=Assoc.BEFORE)
-
-    import json
-    from datetime import datetime, timezone
-
-    comment_id = f"claude-{int(time.time() * 1000)}"
-
-    with conn.doc.transaction(origin=authors.CLAUDE):
-        comment = Map()
-        comments_map[comment_id] = comment
-        comment["anchorStart"] = json.dumps(start_si.to_json())
-        comment["anchorEnd"] = json.dumps(end_si.to_json())
-        comment["anchor"] = json.dumps(start_si.to_json())
-        comment["quote"] = quote
-        comment["author"] = "claude"
-        comment["body"] = body
-        comment["resolved"] = False
-        comment["created"] = datetime.now(timezone.utc).isoformat()
-
+    try:
+        comments.add_comment(
+            conn.doc, conn.text, comments_map, quote, body, author=authors.CLAUDE
+        )
+    except ValueError as e:
+        return str(e)
     return f"Comment added on '{room}': {body!r} anchored to {quote!r}"
 
 
@@ -872,33 +846,11 @@ async def list_comments(room: str, ctx: Context) -> str:
     """
     state = _get_state(ctx)
     conn = await state.connect(room)
-
-    comments: Map = conn.doc.get("comments", type=Map)
-    if not comments:
-        return f"No comments on '{room}'"
-
-    entries = []
-    for comment_id in comments:
-        comment = comments[comment_id]
-        if not isinstance(comment, Map):
-            continue
-        entries.append(
-            {
-                "id": comment_id,
-                "author": comment.get("author", "unknown"),
-                "quote": comment.get("quote", ""),
-                "body": comment.get("body", ""),
-                "resolved": comment.get("resolved", False),
-                "orphaned": comment.get("orphaned", False),
-                "created": comment.get("created", ""),
-            }
-        )
+    comments_map: Map = conn.doc.get("comments", type=Map)
+    entries = comments.list_comments(comments_map)
 
     if not entries:
         return f"No comments on '{room}'"
-
-    # Sort by created time
-    entries.sort(key=lambda e: e["created"])
 
     lines = [f"Comments on '{room}' — {len(entries)} comment(s):\n"]
     for e in entries:
@@ -929,21 +881,10 @@ async def resolve_comment(room: str, quote: str, ctx: Context) -> str:
     """
     state = _get_state(ctx)
     conn = await state.connect(room)
-
     comments_map: Map = conn.doc.get("comments", type=Map)
-
-    resolved_count = 0
-    for comment_id in comments_map:
-        comment = comments_map[comment_id]
-        if not isinstance(comment, Map):
-            continue
-        if comment.get("resolved"):
-            continue
-        if comment.get("quote", "").strip() == quote.strip():
-            with conn.doc.transaction(origin=authors.CLAUDE):
-                comment["resolved"] = True
-            resolved_count += 1
-
+    resolved_count = comments.resolve_comment(
+        conn.doc, comments_map, quote, author=authors.CLAUDE
+    )
     if resolved_count == 0:
         return f"No active comment found with quote: {quote!r}"
     return f"Resolved {resolved_count} comment(s) on '{room}' matching {quote!r}"

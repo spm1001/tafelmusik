@@ -241,7 +241,7 @@ class TestCaluteRoundTrip:
         # Re-anchor within new section bounds
         new_bounds = document.find_section(str(text), "## Section")
         result = comments.reanchor(
-            text, comments_map, affected, new_bounds[0], new_bounds[1]
+            text, comments_map, affected, new_bounds[0], new_bounds[1], author=authors.CLAUDE
         )
         assert result["reanchored"] == [affected[0]["id"]]
         assert result["orphaned"] == []

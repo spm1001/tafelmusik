@@ -930,6 +930,7 @@ async def test_reanchor_comment_survives_replace_section(server):
             affected,
             search_start=new_bounds[0],
             search_end=new_bounds[1],
+            author=authors.CLAUDE,
         )
 
         assert "browser-c1" in result["reanchored"]
@@ -1002,6 +1003,7 @@ async def test_reanchor_comment_orphaned_over_wire(server):
             affected,
             search_start=new_bounds[0],
             search_end=new_bounds[1],
+            author=authors.CLAUDE,
         )
 
         assert "browser-c2" in result["orphaned"]

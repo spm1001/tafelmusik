@@ -2,7 +2,7 @@
 
 import json
 
-from pycrdt import Assoc, Doc, Map, StickyIndex, Text
+from pycrdt import Doc, Map, StickyIndex, Text
 
 from tafelmusik import authors, comments, document
 
@@ -27,27 +27,10 @@ def _add_comment(
     comment_id: str | None = None,
 ) -> str:
     """Add a comment anchored to quote text. Returns comment ID."""
-    content = str(text)
-    idx = content.find(quote)
-    assert idx != -1, f"Quote not found: {quote!r}"
-
-    start_si = StickyIndex.new(text, idx, assoc=Assoc.AFTER)
-    end_si = StickyIndex.new(text, idx + len(quote), assoc=Assoc.BEFORE)
-
     cid = comment_id or f"test-{id(body)}"
-    with text.doc.transaction():
-        comment = Map()
-        comments_map[cid] = comment
-        comment["anchorStart"] = json.dumps(start_si.to_json())
-        comment["anchorEnd"] = json.dumps(end_si.to_json())
-        comment["anchor"] = json.dumps(start_si.to_json())
-        comment["quote"] = quote
-        comment["author"] = author
-        comment["body"] = body
-        comment["resolved"] = False
-        comment["created"] = "2026-01-01T00:00:00Z"
-
-    return cid
+    return comments.add_comment(
+        text.doc, text, comments_map, quote, body, author=author, comment_id=cid
+    )
 
 
 # --- collect_affected ---
@@ -127,6 +110,7 @@ def test_reanchor_quote_survives_replace_section():
         affected,
         search_start=new_bounds[0],
         search_end=new_bounds[1],
+        author=authors.TEST,
     )
 
     assert "c1" in result["reanchored"]
@@ -151,6 +135,7 @@ def test_reanchor_rebuilds_valid_anchors():
         affected,
         search_start=new_bounds[0],
         search_end=new_bounds[1],
+        author=authors.TEST,
     )
     assert "c1" in result["reanchored"]
 
@@ -182,6 +167,7 @@ def test_reanchor_quote_deleted_orphans():
         affected,
         search_start=new_bounds[0],
         search_end=new_bounds[1],
+        author=authors.TEST,
     )
 
     assert "c1" in result["orphaned"]
@@ -212,6 +198,7 @@ def test_reanchor_mixed_survival():
         affected,
         search_start=new_bounds[0],
         search_end=new_bounds[1],
+        author=authors.TEST,
     )
 
     assert "c1" in result["reanchored"]  # "The API uses REST" survived
@@ -244,7 +231,7 @@ def test_reanchor_replace_all_preserves_surviving():
 
     affected = comments.collect_affected(text, cmap, 0, len(str(text)))
     document.replace_all(text, "Hello world, new content", author=authors.TEST)
-    result = comments.reanchor(text, cmap, affected)
+    result = comments.reanchor(text, cmap, affected, author=authors.TEST)
 
     assert "c1" in result["reanchored"]
     assert "c2" in result["orphaned"]
@@ -283,6 +270,7 @@ def test_reanchor_clears_orphaned_flag():
         affected,
         search_start=new_bounds[0],
         search_end=new_bounds[1],
+        author=authors.TEST,
     )
     assert cmap["c1"]["orphaned"] is True
 
@@ -298,6 +286,7 @@ def test_reanchor_clears_orphaned_flag():
         affected2,
         search_start=new_bounds2[0],
         search_end=new_bounds2[1],
+        author=authors.TEST,
     )
     assert "c1" in result["reanchored"]
     assert cmap["c1"].get("orphaned") is False
@@ -326,6 +315,7 @@ def test_no_false_match_outside_section():
         affected,
         search_start=new_bounds[0],
         search_end=new_bounds[1],
+        author=authors.TEST,
     )
 
     # Should orphan — not false-match against Step 2
@@ -352,6 +342,7 @@ def test_reanchor_patch_orphans_deleted_quote():
         affected,
         search_start=patch_start,
         search_end=patch_start + len("red cat"),
+        author=authors.TEST,
     )
 
     # "brown fox" is gone — comment orphaned
@@ -371,3 +362,134 @@ def test_reanchor_patch_preserves_surviving_quote():
 
     # "brown fox" is outside the patch range — not collected
     assert len(affected) == 0
+
+
+# --- add_comment ---
+
+
+def test_add_comment_anchors_and_stores():
+    """add_comment creates StickyIndex anchors and populates all Y.Map fields."""
+    text, cmap = _make_doc("Hello world")
+    cid = comments.add_comment(
+        text.doc, text, cmap, "Hello", "greeting", author="sameer", comment_id="c1"
+    )
+    assert cid == "c1"
+    c = cmap["c1"]
+    assert c["quote"] == "Hello"
+    assert c["body"] == "greeting"
+    assert c["author"] == "sameer"
+    assert c["resolved"] is False
+    assert c["anchorStart"]  # non-empty JSON string
+    assert c["anchorEnd"]
+    assert c["anchor"]
+
+
+def test_add_comment_generates_id():
+    """Without explicit comment_id, generates author-prefixed ID."""
+    text, cmap = _make_doc("Hello world")
+    cid = comments.add_comment(
+        text.doc, text, cmap, "Hello", "greeting", author="sameer"
+    )
+    assert cid.startswith("sameer-")
+
+
+def test_add_comment_raises_on_missing_quote():
+    """add_comment raises ValueError when quote text is not in the document."""
+    text, cmap = _make_doc("Hello world")
+    try:
+        comments.add_comment(
+            text.doc, text, cmap, "nonexistent", "body", author="sameer"
+        )
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "nonexistent" in str(e)
+
+
+# --- list_comments ---
+
+
+def test_list_comments_empty():
+    """Empty comments map returns empty list."""
+    _, cmap = _make_doc("Hello")
+    assert comments.list_comments(cmap) == []
+
+
+def test_list_comments_returns_all_fields():
+    """list_comments returns all expected fields sorted by creation time."""
+    text, cmap = _make_doc("Hello world")
+    _add_comment(text, cmap, "Hello", "first", comment_id="c1")
+    _add_comment(text, cmap, "world", "second", comment_id="c2")
+    entries = comments.list_comments(cmap)
+    assert len(entries) == 2
+    for e in entries:
+        assert set(e.keys()) == {"id", "author", "quote", "body", "resolved", "orphaned", "created"}
+
+
+def test_list_comments_includes_resolved():
+    """Resolved comments appear in the list (with resolved=True)."""
+    text, cmap = _make_doc("Hello world")
+    _add_comment(text, cmap, "Hello", "greeting", comment_id="c1")
+    with text.doc.transaction():
+        cmap["c1"]["resolved"] = True
+    entries = comments.list_comments(cmap)
+    assert len(entries) == 1
+    assert entries[0]["resolved"] is True
+
+
+# --- resolve_comment ---
+
+
+def test_resolve_comment_by_quote():
+    """resolve_comment marks matching unresolved comment as resolved."""
+    text, cmap = _make_doc("Hello world")
+    _add_comment(text, cmap, "Hello", "greeting", comment_id="c1")
+    count = comments.resolve_comment(text.doc, cmap, "Hello", author=authors.CLAUDE)
+    assert count == 1
+    assert cmap["c1"]["resolved"] is True
+
+
+def test_resolve_comment_no_match():
+    """resolve_comment returns 0 when no comment matches the quote."""
+    text, cmap = _make_doc("Hello world")
+    _add_comment(text, cmap, "Hello", "greeting", comment_id="c1")
+    count = comments.resolve_comment(text.doc, cmap, "nonexistent", author=authors.CLAUDE)
+    assert count == 0
+    assert cmap["c1"]["resolved"] is False
+
+
+def test_resolve_comment_skips_already_resolved():
+    """Already-resolved comments are not counted again."""
+    text, cmap = _make_doc("Hello world")
+    _add_comment(text, cmap, "Hello", "greeting", comment_id="c1")
+    with text.doc.transaction():
+        cmap["c1"]["resolved"] = True
+    count = comments.resolve_comment(text.doc, cmap, "Hello", author=authors.CLAUDE)
+    assert count == 0
+
+
+def test_resolve_comment_strips_whitespace():
+    """Quote matching strips leading/trailing whitespace."""
+    text, cmap = _make_doc("Hello world")
+    _add_comment(text, cmap, "Hello", "greeting", comment_id="c1")
+    count = comments.resolve_comment(text.doc, cmap, "  Hello  ", author=authors.CLAUDE)
+    assert count == 1
+
+
+# --- clear_all ---
+
+
+def test_clear_all_removes_comments():
+    """clear_all deletes all comments from the Y.Map."""
+    text, cmap = _make_doc("Hello world")
+    _add_comment(text, cmap, "Hello", "first", comment_id="c1")
+    _add_comment(text, cmap, "world", "second", comment_id="c2")
+    count = comments.clear_all(text.doc, cmap, author=authors.CLAUDE)
+    assert count == 2
+    assert len(list(cmap)) == 0
+
+
+def test_clear_all_empty_map():
+    """clear_all on empty map returns 0."""
+    text, cmap = _make_doc("Hello")
+    count = comments.clear_all(text.doc, cmap, author=authors.CLAUDE)
+    assert count == 0
