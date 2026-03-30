@@ -6,12 +6,14 @@ functions, SQLiteYStore). No dependency on pycrdt.websocket.
 
 import asyncio
 import logging
+import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from pycrdt import (
     Doc,
+    Text,
     YMessageType,
     create_sync_message,
     create_update_message,
@@ -179,14 +181,30 @@ class Room:
 class RoomManager:
     """Manages document rooms with lazy creation and persistence restore."""
 
-    def __init__(self, store_cls: type[SQLiteYStore]):
+    def __init__(self, store_cls: type[SQLiteYStore], docs_dir: Path):
         self._store_cls = store_cls
+        self._docs_dir = docs_dir
         self.rooms: dict[str, Room] = {}
 
     async def get_room(self, name: str) -> Room:
-        """Get or create a room, restoring any persisted state."""
+        """Get or create a room, hydrating from .md file or SQLite.
+
+        Priority: .md file in docs_dir → SQLite store → empty Doc.
+        During migration, rooms without .md files fall back to SQLite.
+        """
         if name not in self.rooms:
-            doc = await _restore_ydoc(self._store_cls, name)
+            md_path = self._docs_dir / f"{name}.md"
+            if md_path.exists():
+                doc = Doc()
+                text = doc.get("content", type=Text)
+                content = md_path.read_text()
+                if content:
+                    with doc.transaction():
+                        text += content
+                log.info("Room %s: hydrated from %s", name, md_path)
+            else:
+                doc = await _restore_ydoc(self._store_cls, name)
+
             store = self._store_cls(path=name)
             room = Room(name, doc, store)
             await room.start()
@@ -214,10 +232,14 @@ class RoomManager:
 def create_app(
     db_path: str | Path = ROOT / "data" / "tafelmusik.db",
     public_dir: str | Path = ROOT / "public",
+    docs_dir: str | Path | None = None,
 ) -> Starlette:
     """Create the ASGI application with the given configuration."""
 
     _db_path = str(db_path)
+    _docs_dir = Path(docs_dir) if docs_dir else Path(
+        os.environ.get("TAFELMUSIK_DOCS_DIR", ROOT / "docs")
+    )
     Store = type(
         "Store",
         (SQLiteYStore,),
@@ -232,7 +254,7 @@ def create_app(
         },
     )
 
-    manager = RoomManager(store_cls=Store)
+    manager = RoomManager(store_cls=Store, docs_dir=_docs_dir)
 
     async def websocket_endpoint(websocket: WebSocket):
         room_name = websocket.path_params.get("room", "default")
@@ -250,11 +272,21 @@ def create_app(
         except Exception:
             return set()  # DB may not exist yet
 
+    def _scan_doc_files() -> set[str]:
+        """Scan docs_dir for .md files, returning room names."""
+        if not _docs_dir.exists():
+            return set()
+        return {
+            str(md.relative_to(_docs_dir).with_suffix(""))
+            for md in _docs_dir.rglob("*.md")
+        }
+
     async def list_rooms(request):
-        """Return room names from both in-memory rooms and SQLite store."""
+        """Return room names from in-memory rooms, SQLite store, and .md files."""
         memory_rooms = set(manager.rooms.keys())
         persisted_rooms = await asyncio.to_thread(_query_persisted_rooms)
-        all_rooms = sorted(memory_rooms | persisted_rooms)
+        file_rooms = await asyncio.to_thread(_scan_doc_files)
+        all_rooms = sorted(memory_rooms | persisted_rooms | file_rooms)
         return JSONResponse({"rooms": all_rooms})
 
     @asynccontextmanager

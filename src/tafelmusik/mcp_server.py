@@ -19,10 +19,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -681,6 +683,59 @@ async def list_docs(ctx: Context) -> str:
         return "Documents:\n" + "\n".join(f"  - {r}" for r in rooms)
     except httpx.HTTPError:
         return "Could not list documents (is the Tafelmusik server running?)"
+
+
+@mcp.tool()
+async def flush_doc(room: str, ctx: Context) -> str:
+    """Flush document to .md file on disk, wipe comments, git commit.
+
+    Writes current Y.Text content to the .md file, clears all comments
+    from the Y.Map, and commits the file to git. This is the "save" —
+    the .md file becomes the durable artifact.
+
+    Args:
+        room: Document room name (maps to file path relative to docs_dir)
+    """
+    state = _get_state(ctx)
+    conn = await state.connect(room)
+
+    content = str(conn.text)
+    default_docs = Path(__file__).resolve().parent.parent.parent / "docs"
+    docs_dir = Path(os.environ.get("TAFELMUSIK_DOCS_DIR", default_docs))
+    md_path = docs_dir / f"{room}.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(content)
+
+    # Wipe comments
+    comments_map: Map = conn.doc.get("comments", type=Map)
+    comment_keys = list(comments_map)
+    if comment_keys:
+        with conn.doc.transaction(origin=authors.CLAUDE):
+            for key in comment_keys:
+                del comments_map[key]
+
+    # Git commit the file
+    git_msg = f"flush: {room}"
+    try:
+        subprocess.run(
+            ["git", "add", str(md_path)],
+            cwd=str(docs_dir),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", git_msg, "--", str(md_path)],
+            cwd=str(docs_dir),
+            check=True,
+            capture_output=True,
+        )
+        git_status = " Git committed."
+    except subprocess.CalledProcessError:
+        git_status = " Git commit skipped (no changes or not a repo)."
+
+    wiped = len(comment_keys)
+    comment_note = f" {wiped} comment(s) cleared." if wiped else ""
+    return f"Flushed {len(content)} chars to {md_path}.{comment_note}{git_status}"
 
 
 @mcp.tool()

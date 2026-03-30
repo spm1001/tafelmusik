@@ -6,9 +6,23 @@ Two processes, one codebase: ASGI server (always-running, holds Y.Doc) and MCP s
 
 Neither the ASGI server nor the MCP server depends on `pycrdt-websocket`. The entire sync protocol — both server-side and client-side — uses only public pycrdt APIs: `create_sync_message`, `handle_sync_message`, `create_update_message`, `doc.events()`. The only pycrdt dependencies are `pycrdt` (core) and `pycrdt-store` (SQLiteYStore). This was a deliberate choice to eliminate version-pinning anxiety from private API coupling in a 24/7 server process.
 
-## The files-on-disk pivot
+## The files-on-disk pivot (calute)
 
-The current architecture stores documents only as Yjs updates in SQLite — no .md files on disk. This creates a coupling that prevents editing documents with other tools, git-tracking content, or pointing Tafelmusik at an existing folder of markdown. The emerging direction: files on disk are truth, CRDT is the collaboration overlay. Room names would map to file paths, hydrate CRDT from file on open, flush back on save/disconnect. SQLite holds ephemeral session state (Yjs updates for real-time sync), but the durable artifact is the .md file. This would make `list_docs` = `ls *.md`, enable git workflows, and let Claude edit files directly. Many of the UI outcomes (naming, listing, lifecycle — tfm-dibuca) simplify when documents are files. The room poller (tfm-ditufu) is a pragmatic stopgap in this framing, not the final answer for room discovery.
+The current architecture stores documents only as Yjs updates in SQLite — no .md files on disk. This creates a coupling that prevents editing documents with other tools, git-tracking content, or pointing Tafelmusik at an existing folder of markdown. The resolved design: **the .md file is truth, the CRDT is the collaboration overlay.**
+
+Three phases, all designed and agreed:
+
+**Phase 1 — File-backed rooms:** `docs_dir` parameter on ASGI server (default `ROOT / "docs"`). Room names = relative file paths (`meeting/2026-03-30` → `docs/meeting/2026-03-30.md`). Hydrate CRDT from file on room open, fall back to SQLite for migration. New `flush_doc` MCP tool writes Y.Text to .md, wipes comments, discards CRDT log. Directory listing replaces room-based `list_docs`. New doc flow: navigate to room name → type → flush creates the .md file.
+
+**Hydrate has three paths:** File exists → hydrate from file (fresh Doc, `text += content`). No file but SQLite data → fall back to `_restore_ydoc`. Neither → empty Doc. The current `_restore_ydoc` creates its own Doc internally; the new `get_room()` must create the Doc itself for the file path.
+
+**Flush is explicit** (Claude-initiated). If a session crashes before flush, edits exist only in CRDT/SQLite — acceptable since CRDT handles crash recovery during session. Comments wipe on flush because they're ephemeral session annotations, not durable content.
+
+**Phase 2 — Drift detection:** State vector drift score (doc.get_update(snapshot) byte size) as a native CRDT metric for detecting when the CRDT has diverged significantly from the file. Awareness protocol patterns from Yjs for Phase 2 signaling.
+
+**Phase 3 — Spawn-on-comment:** Comments as turn signal — when Sameer comments, Claude gets notified and can respond. Not continuous document-body notifications.
+
+**Key implementation brief** lives in `.bon/contributions/2026-03-30T163000.md` with specific pseudocode, file-change matrix, and gotchas. The spike tests (`calute_spike_test.py`, 9 tests) validate hydrate→edit→comment→flush→re-hydrate round-trip at the pure pycrdt level — production goes through RoomManager, WebSocket sync, two processes.
 
 ## Comments: inline reactions, not editorial workflow
 
@@ -82,8 +96,12 @@ When N libraries interact and something breaks, bisect the layers before theoris
 
 ## Persistence landmine: pycrdt-store squashing
 
-pycrdt-store 0.1.3 has a data-loss bug in SQLiteYStore.write() — the inline squash path has `ydoc.apply_update(update)` indented inside `if self._decompress:`, so without compression (the default) it replays into an empty Doc and destroys all stored updates. Tafelmusik disables squashing (`squash_after_inactivity_of=None`) as a workaround — correctness preserved, but the yupdates table grows unboundedly. Upstream fix is PR y-crdt/pycrdt-store#25. Re-enable squashing after the fix ships. If the upstream repo stays dormant, the correctly-written `_squash_document_history()` method in the PR could serve as a reference for owning persistence ourselves.
+pycrdt-store 0.1.3 has a data-loss bug in SQLiteYStore.write() — the inline squash path has `ydoc.apply_update(update)` indented inside `if self._decompress:`, so without compression (the default) it replays into an empty Doc and destroys all stored updates. Tafelmusik disables squashing (`squash_after_inactivity_of=None`) as a workaround — correctness preserved, but the yupdates table grows unboundedly. Upstream fix is PR y-crdt/pycrdt-store#25. Re-enable squashing after the fix ships. If the upstream repo stays dormant, the correctly-written `_squash_document_history()` method in the PR could serve as a reference for owning persistence ourselves. With calute, flush becomes the compaction — sidesteps the squashing bug entirely for file-backed rooms.
 
 ## Document operations
 
 replace_section finds headings by exact text match, not by position. This matters because in a CRDT, positions shift as peers edit concurrently. Text matching is stable; index-based matching isn't. The section boundary algorithm (same-or-higher heading level) matches CommonMark's implicit section structure.
+
+## Token efficiency insight
+
+CRDTs are already more token-efficient than a file-based approach would be. The CRDT pushes diffs over the wire — adding a file layer on top would mean hauling full file content in and out of context. The drift threshold (how much CRDT state can diverge from the file before forcing a resync) is a Goldilocks problem: too low = wasted resync tokens, too high = wasted failed-edit tokens. Comments serve as turn signals rather than continuous notifications — comment events notify Claude, not every keystroke.
