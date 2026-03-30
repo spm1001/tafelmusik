@@ -18,6 +18,8 @@ Three phases, all designed and agreed:
 
 **Flush is explicit** (Claude-initiated). If a session crashes before flush, edits exist only in CRDT/SQLite — acceptable since CRDT handles crash recovery during session. Comments wipe on flush because they're ephemeral session annotations, not durable content.
 
+**The CRDT duplication trap:** Every file hydration creates NEW CRDT operations (new client ID, new clocks). Any peer holding old operations will merge both sets — producing duplicated content. Yjs merges by operation identity, not content identity: two inserts of "hello" from different client IDs produce "hellohello". Room retention (keeping file-backed rooms in memory) prevents duplication on idle reconnects, but not across server restarts where the room is necessarily fresh. SQLite preserves operation identity across room lifecycles within a process; file hydration should be treated as a one-time seed, not a repeatable operation. The browser-side fix (tfm-wiseha) is: detect server restart and discard the stale local Y.Doc before reconnecting.
+
 **Phase 2 — Drift detection:** State vector drift score (doc.get_update(snapshot) byte size) as a native CRDT metric for detecting when the CRDT has diverged significantly from the file. Awareness protocol patterns from Yjs for Phase 2 signaling.
 
 **Phase 3 — Spawn-on-comment:** Comments as turn signal — when Sameer comments, Claude gets notified and can respond. Not continuous document-body notifications.
