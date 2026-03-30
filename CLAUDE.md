@@ -7,7 +7,7 @@ Collaborative editing layer — Yjs Y.Text + CodeMirror 6 + pycrdt. Both Sameer 
 Two processes, one codebase:
 
 1. **ASGI server** (`asgi_server.py`) — always-running (systemd). Owns room management (Room + RoomManager), serves web editor, handles WebSocket sync. Zero pycrdt.websocket dependency — uses public pycrdt APIs only.
-2. **MCP server** (`mcp_server.py`) — ephemeral (spawned by CC). Connects to ASGI server via WebSocket as pycrdt client. Provides tools (`read_doc`, `edit_doc`, `load_doc`, `list_docs`) AND channel notifications (push alerts when Sameer edits). The observer, debouncer, and notification sender all live here because transaction origins are local to a Doc instance — they don't survive the wire, so filtering Claude's own edits requires the observer to be in the same process as the Doc.
+2. **MCP server** (`mcp_server.py`) — ephemeral (spawned by CC). Connects to ASGI server via WebSocket as pycrdt client. Provides tools (`read_doc`, `edit_doc`, `load_doc`, `list_docs`, `flush_doc`) AND channel notifications (push alerts when Sameer edits). The observer, debouncer, and notification sender all live here because transaction origins are local to a Doc instance — they don't survive the wire, so filtering Claude's own edits requires the observer to be in the same process as the Doc.
 
 ## Module Layout
 
@@ -20,6 +20,7 @@ src/tafelmusik/
   comments.py          # Y.Map comment operations + StickyIndex re-anchoring
   uploads.py           # Image upload handling
   *_test.py            # Tests adjacent to source
+docs/                  # Markdown files on disk (calute) — room names map to file paths
 public/
   index.html           # CodeMirror editor
   cm-entry.js          # JS source (unbundled)
@@ -59,6 +60,12 @@ Mac setup (one-time): `git remote add hezza modha@hezza:Repos/batterie/tafelmusi
 
 - **Private APIs:** When using library internals (underscore-prefixed), add a comment block naming the private APIs, the validated version, and a runtime assertion. File a bon to own the functionality via public APIs. Don't block on it — ship first, own later.
 - **Port:** 3456 (ASGI server). MCP server discovers via `TAFELMUSIK_URL` env var.
+- **Docs directory (calute):** `create_app(docs_dir=...)` defaults to `ROOT / "docs"`, overridable via `TAFELMUSIK_DOCS_DIR` env var. Both ASGI and MCP must use the same path. Room names are file paths relative to docs_dir: room `meeting/2026-03-30` maps to `docs/meeting/2026-03-30.md`.
+- **File hydration priority:** .md file in docs_dir → SQLite store → empty Doc. File takes priority because SQLite may hold stale CRDT state from a previous session.
+- **`flush_doc` tool:** Reads Y.Text, writes .md to docs_dir, wipes comments from Y.Map, git commits. The flush IS the compaction — sidesteps the pycrdt-store squashing bug for file-backed rooms.
+- **Path validation:** `RoomManager._safe_doc_path()` resolves room names and rejects paths escaping docs_dir. `flush_doc` has the same check. Both use `Path.resolve()` + `is_relative_to()`.
+- **Room retention:** File-backed rooms stay in memory after last client disconnects (`remove_if_empty` skips cleanup). This prevents CRDT re-hydration duplication when WebSocket reconnects — each re-hydration creates new CRDT ops that merge with the client's old state, doubling content.
+- **`/api/rooms` response:** Returns `[{"name": str, "active": bool}]`. Active = room is in memory with clients. The MCP room poller only connects to active rooms to avoid opening a WebSocket per .md file.
 - **Persistence:** SQLiteYStore stores updates (not documents). Squashing disabled (pycrdt-store 0.1.3 data-loss bug, see `.bon/understanding.md`). Re-enable after upstream fix ships.
 - **Version:** Single source in `.claude-plugin/plugin.json`.
 - **Tests:** Adjacent to source (`*_test.py`). pytest + pytest-asyncio.
@@ -84,8 +91,8 @@ Mac setup (one-time): `git remote add hezza modha@hezza:Repos/batterie/tafelmusi
 - `aconnect_ws` uses anyio cancel scopes that are task-bound. The WebSocket and sync loop must run in the SAME asyncio Task — `_sync_task()` in `mcp_server.py` wraps both. Separating them across tasks causes `RuntimeError: Attempted to exit cancel scope in a different task`. Same applies to test fixtures — use `@asynccontextmanager` helpers so `__aenter__`/`__aexit__` run in the same Task. The `connect_peer()` test helper in `conftest.py` handles this correctly.
 - The MCP server owns its sync protocol (~40 lines in `_sync_loop`/`_send_updates`/`_heartbeat`) using only public pycrdt APIs: `create_sync_message`, `handle_sync_message`, `create_update_message`, `doc.events()`. No Provider subclass, no private API coupling.
 - The ASGI server's Room broadcasts via `doc.events()` — one background task per room listens for Doc changes, sends `create_update_message` to all connected channels concurrently (`asyncio.gather`), and persists via `store.write()`. Room.start() waits for both DB initialization and the doc observer before returning, so serve() is safe to call immediately.
-- Rooms are cleaned up when the last client disconnects (`remove_if_empty`). Next connection to the same room restores from SQLite.
-- **Room poller:** The MCP server polls `GET /api/rooms` every 5 seconds and connects to any rooms not yet in `state.rooms`. This gives Claude awareness of rooms Sameer creates without any tool call. Started automatically in the MCP lifespan. The poller keeps rooms alive (the MCP server is a connected client), so rooms persist while Claude's session is active.
+- Non-file-backed rooms are cleaned up when the last client disconnects (`remove_if_empty`). File-backed rooms stay in memory to prevent CRDT duplication. Next connection to a cleaned-up room restores from SQLite.
+- **Room poller:** The MCP server polls `GET /api/rooms` every 5 seconds and connects to **active** rooms not yet in `state.rooms`. Supports both old format (string list) and new format (dict with `name`/`active`). Started automatically in the MCP lifespan.
 - No `pycrdt-websocket` dependency anywhere — `pycrdt` + `pycrdt-store` only.
 - `text[start:end] = new_content` does delete+insert but strips formatting attrs. Use `del text[start:end]` + `text.insert(start, content, attrs=...)` to preserve authorship. `document.py` handles this — call its functions rather than operating on Text directly.
 - `text.clear()` removes all content (equivalent to `del text[:]`).
