@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from pycrdt import Assoc, Map, StickyIndex, Text
+
+log = logging.getLogger(__name__)
 
 
 def collect_affected(
@@ -40,6 +43,7 @@ def collect_affected(
             si = StickyIndex.from_json(json.loads(anchor_json_str), text)
             pos = si.get_index()
         except Exception:
+            log.warning("comment %s: failed to resolve anchor, skipping", comment_id)
             continue
 
         if section_start <= pos < section_end:

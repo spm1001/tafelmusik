@@ -609,11 +609,34 @@ async def edit_doc(
         if not find:
             return "patch mode requires 'find' parameter"
         try:
+            comments_map: Map = conn.doc.get("comments", type=Map)
+            doc_content = str(conn.text)
+            patch_start = doc_content.find(find)
+            if patch_start != -1:
+                patch_end = patch_start + len(find)
+                affected = comments.collect_affected(
+                    conn.text, comments_map, patch_start, patch_end
+                )
+            else:
+                affected = []
             document.patch(conn.text, find, replace, author=authors.CLAUDE)
+            if affected:
+                # Search region: where the patch landed + replacement length
+                search_end = patch_start + len(replace) if replace else patch_start
+                result = comments.reanchor(
+                    conn.text,
+                    comments_map,
+                    affected,
+                    search_start=patch_start,
+                    search_end=max(search_end, patch_start + 1),
+                )
+            else:
+                result = {"reanchored": [], "orphaned": []}
         except ValueError as e:
             return f"Patch failed: {e}"
         action = "Deleted" if not replace else "Patched"
-        return f"{action} {len(find)} chars in '{room}'"
+        suffix = _reanchor_summary(result)
+        return f"{action} {len(find)} chars in '{room}'{suffix}"
     else:
         return f"Unknown mode '{mode}'. Use 'append', 'replace_all', 'replace_section', or 'patch'."
 

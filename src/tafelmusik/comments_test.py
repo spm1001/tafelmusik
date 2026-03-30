@@ -91,6 +91,22 @@ def test_collect_includes_inside_range():
     assert result[0]["id"] == "c1"
 
 
+def test_collect_skips_corrupted_anchor():
+    """Comments with invalid anchor JSON are skipped with a warning, not crash."""
+    text, cmap = _make_doc("Hello world")
+    # Manually create a comment with garbage anchor
+    with text.doc.transaction():
+        comment = Map()
+        cmap["bad"] = comment
+        comment["anchor"] = "not valid json {"
+        comment["quote"] = "Hello"
+        comment["author"] = "sameer"
+        comment["body"] = "test"
+        comment["resolved"] = False
+    result = comments.collect_affected(text, cmap, 0, len(str(text)))
+    assert len(result) == 0  # skipped, not crashed
+
+
 # --- reanchor: quote survives ---
 
 
@@ -315,3 +331,43 @@ def test_no_false_match_outside_section():
     # Should orphan — not false-match against Step 2
     assert "c1" in result["orphaned"]
     assert "c1" not in result["reanchored"]
+
+
+# --- patch mode re-anchoring ---
+
+
+def test_reanchor_patch_orphans_deleted_quote():
+    """Patch that deletes commented text orphans the comment."""
+    text, cmap = _make_doc("The quick brown fox jumps over the lazy dog.")
+    _add_comment(text, cmap, "brown fox", "change animal", comment_id="c1")
+
+    content = str(text)
+    find = "brown fox"
+    patch_start = content.find(find)
+    affected = comments.collect_affected(text, cmap, patch_start, patch_start + len(find))
+    document.patch(text, find, "red cat", author=authors.TEST)
+    result = comments.reanchor(
+        text,
+        cmap,
+        affected,
+        search_start=patch_start,
+        search_end=patch_start + len("red cat"),
+    )
+
+    # "brown fox" is gone — comment orphaned
+    assert "c1" in result["orphaned"]
+
+
+def test_reanchor_patch_preserves_surviving_quote():
+    """Patch near a comment that doesn't touch the quoted text — comment survives via CRDT."""
+    text, cmap = _make_doc("The quick brown fox jumps over the lazy dog.")
+    _add_comment(text, cmap, "brown fox", "nice animal", comment_id="c1")
+
+    # Patch "lazy" → "energetic" — doesn't touch "brown fox"
+    content = str(text)
+    find = "lazy"
+    patch_start = content.find(find)
+    affected = comments.collect_affected(text, cmap, patch_start, patch_start + len(find))
+
+    # "brown fox" is outside the patch range — not collected
+    assert len(affected) == 0

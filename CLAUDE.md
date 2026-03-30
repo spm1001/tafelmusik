@@ -17,7 +17,7 @@ src/tafelmusik/
   mcp_server.py        # MCP entry point (tools + channel notifications)
   document.py          # Y.Text operations
   authors.py           # Identity constants (CLAUDE, SAMEER, TEST)
-  comments.py          # Y.Map comment operations + StickyIndex
+  comments.py          # Y.Map comment operations + StickyIndex re-anchoring
   uploads.py           # Image upload handling
   *_test.py            # Tests adjacent to source
 public/
@@ -62,8 +62,9 @@ Mac setup (one-time): `git remote add hezza modha@hezza:Repos/batterie/tafelmusi
 - **Persistence:** SQLiteYStore stores updates (not documents). Squashing disabled (pycrdt-store 0.1.3 data-loss bug, see `.bon/understanding.md`). Re-enable after upstream fix ships.
 - **Version:** Single source in `.claude-plugin/plugin.json`.
 - **Tests:** Adjacent to source (`*_test.py`). pytest + pytest-asyncio.
-- **Comments:** Y.Map "comments" in Y.Doc, each entry a nested Y.Map. Three anchor fields: `anchorStart`/`anchorEnd` (RelativePosition range, tracks live edits), `anchor` (single point, fallback after replace_section), `quote` (text for re-anchoring when positions collapse). Don't remove `anchor` thinking it's redundant — it's the fallback. Frontend sorts by overlap (same conversation = chronological), decorations sort by strict position (RangeSetBuilder requirement). Browser uses `Y.createRelativePositionFromTypeIndex`, MCP uses `StickyIndex.to_json()` — both produce compatible `{item: {client, clock}, assoc}` JSON.
-- **Comments UI state machine:** Two modes — `document` (editing) and `commenting` (compose card visible). Card clicks use CM6 `Annotation` to mark programmatic selections, preventing false transitions. See `cm-entry.js`.
+- **Comments:** Y.Map "comments" in Y.Doc, each entry a nested Y.Map. Four anchor fields: `anchorStart`/`anchorEnd` (RelativePosition range, tracks live edits), `anchor` (single point, fallback), `quote` (text for re-anchoring when positions collapse). Don't remove `anchor` thinking it's redundant — it's the fallback. Frontend sorts by overlap (same conversation = chronological), decorations sort by strict position (RangeSetBuilder requirement). Browser uses `Y.createRelativePositionFromTypeIndex`, MCP uses `StickyIndex.to_json()` — both produce compatible `{item: {client, clock}, assoc}` JSON.
+- **Comment re-anchoring:** `comments.py` exports `collect_affected(text, comments_map, start, end)` and `reanchor(text, comments_map, affected, search_start, search_end)`. Before a destructive edit (replace_section, replace_all, patch), collect comments whose StickyIndex positions fall within the section being replaced. After the edit, search for each comment's `quote` **only within the new section** — not the whole document. Found → rebuild anchors. Gone → set `orphaned: true`. Comments outside the blast radius are untouched (CRDT tracks them). Orphaned comments appear greyed out at the bottom of the browser pane.
+- **Comments UI state machine:** Two modes — `document` (editing) and `commenting` (compose card visible). Card clicks use CM6 `Annotation` to mark programmatic selections, preventing false transitions. Submit via Cmd+Enter or Shift+Enter. See `cm-entry.js`.
 
 ## Gotchas
 

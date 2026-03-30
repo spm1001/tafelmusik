@@ -553,9 +553,7 @@ async def _partition_proxy(target_port):
 
     async def _handle(client_reader, client_writer):
         try:
-            target_reader, target_writer = await asyncio.open_connection(
-                "127.0.0.1", target_port
-            )
+            target_reader, target_writer = await asyncio.open_connection("127.0.0.1", target_port)
         except OSError:
             client_writer.close()
             return
@@ -714,9 +712,7 @@ async def test_no_channel_notification_without_session(server):
         # Don't set state.session — leave it None
         conn = await state.connect("no-session-test")
 
-        document.replace_all(
-            conn.text, "## Test\n\nOriginal.\n", author=authors.CLAUDE
-        )
+        document.replace_all(conn.text, "## Test\n\nOriginal.\n", author=authors.CLAUDE)
         await asyncio.sleep(0.5)
 
         # Browser edits
@@ -877,6 +873,145 @@ async def test_room_poller_ignores_already_connected(server):
         # Same connection object — not replaced
         assert state.rooms["already-connected"] is conn
         assert "Existing content" in str(conn.text)
+
+
+async def test_reanchor_comment_survives_replace_section(server):
+    """Integration: browser comment re-anchors after MCP replace_section over the wire."""
+    import json
+
+    from pycrdt import Assoc, Map, StickyIndex
+
+    from tafelmusik import comments, document
+
+    async with make_state(server) as state:
+        conn = await state.connect("test-reanchor-integration")
+        conn.text += "## Notes\n\nThe API uses REST.\n\nIt supports pagination.\n\n## End\n"
+        await asyncio.sleep(0.5)
+
+        # Simulate browser adding a comment on "The API uses REST"
+        async with connect_peer(server, "test-reanchor-integration") as browser:
+            doc_text = str(browser)
+            idx = doc_text.find("The API uses REST")
+            start_si = StickyIndex.new(browser, idx, assoc=Assoc.AFTER)
+            end_si = StickyIndex.new(browser, idx + len("The API uses REST"), assoc=Assoc.BEFORE)
+
+            comments_map: Map = browser.doc.get("comments", type=Map)
+            with browser.doc.transaction():
+                comment = Map()
+                comments_map["browser-c1"] = comment
+                comment["anchorStart"] = json.dumps(start_si.to_json())
+                comment["anchorEnd"] = json.dumps(end_si.to_json())
+                comment["anchor"] = json.dumps(start_si.to_json())
+                comment["quote"] = "The API uses REST"
+                comment["author"] = "sameer"
+                comment["body"] = "Consider GraphQL"
+                comment["resolved"] = False
+            await asyncio.sleep(0.5)
+
+        # Wait for comment to sync to MCP
+        await asyncio.sleep(0.5)
+
+        # MCP does replace_section with re-anchoring
+        mcp_comments: Map = conn.doc.get("comments", type=Map)
+        doc_content = str(conn.text)
+        heading = "## Notes"
+        bounds = document.find_section(doc_content, heading)
+        affected = comments.collect_affected(conn.text, mcp_comments, bounds[0], bounds[1])
+        document.replace_section(
+            conn.text,
+            "## Notes\n\nNew intro.\n\nThe API uses REST and GraphQL.\n",
+            author=authors.CLAUDE,
+        )
+        new_bounds = document.find_section(str(conn.text), heading)
+        result = comments.reanchor(
+            conn.text,
+            mcp_comments,
+            affected,
+            search_start=new_bounds[0],
+            search_end=new_bounds[1],
+        )
+
+        assert "browser-c1" in result["reanchored"]
+        # Verify the comment's anchor resolves to the right position in new text
+        new_content = str(conn.text)
+        expected_idx = new_content.find("The API uses REST")
+        anchor_json = json.loads(mcp_comments["browser-c1"]["anchorStart"])
+        si = StickyIndex.from_json(anchor_json, conn.text)
+        assert si.get_index() == expected_idx
+
+        await asyncio.sleep(0.5)
+
+    # Verify the re-anchored comment synced back to a new client
+    async with connect_peer(server, "test-reanchor-integration") as text:
+        comments_map: Map = text.doc.get("comments", type=Map)
+        comment = comments_map["browser-c1"]
+        assert comment.get("quote") == "The API uses REST"
+        assert comment.get("orphaned") is None or comment.get("orphaned") is False
+
+
+async def test_reanchor_comment_orphaned_over_wire(server):
+    """Integration: browser comment is orphaned when quote is deleted via MCP."""
+    import json
+
+    from pycrdt import Assoc, Map, StickyIndex
+
+    from tafelmusik import comments, document
+
+    async with make_state(server) as state:
+        conn = await state.connect("test-orphan-integration")
+        conn.text += "## Notes\n\nUse pagination for results.\n\n## End\n"
+        await asyncio.sleep(0.5)
+
+        # Browser adds comment
+        async with connect_peer(server, "test-orphan-integration") as browser:
+            doc_text = str(browser)
+            idx = doc_text.find("Use pagination")
+            start_si = StickyIndex.new(browser, idx, assoc=Assoc.AFTER)
+
+            comments_map: Map = browser.doc.get("comments", type=Map)
+            with browser.doc.transaction():
+                comment = Map()
+                comments_map["browser-c2"] = comment
+                comment["anchor"] = json.dumps(start_si.to_json())
+                comment["anchorStart"] = json.dumps(start_si.to_json())
+                end_si = StickyIndex.new(browser, idx + len("Use pagination"), assoc=Assoc.BEFORE)
+                comment["anchorEnd"] = json.dumps(end_si.to_json())
+                comment["quote"] = "Use pagination"
+                comment["author"] = "sameer"
+                comment["body"] = "offset/limit?"
+                comment["resolved"] = False
+            await asyncio.sleep(0.5)
+
+        await asyncio.sleep(0.5)
+
+        # MCP replaces section — quote text gone
+        mcp_comments: Map = conn.doc.get("comments", type=Map)
+        doc_content = str(conn.text)
+        bounds = document.find_section(doc_content, "## Notes")
+        affected = comments.collect_affected(conn.text, mcp_comments, bounds[0], bounds[1])
+        document.replace_section(
+            conn.text,
+            "## Notes\n\nResults are streamed.\n",
+            author=authors.CLAUDE,
+        )
+        new_bounds = document.find_section(str(conn.text), "## Notes")
+        result = comments.reanchor(
+            conn.text,
+            mcp_comments,
+            affected,
+            search_start=new_bounds[0],
+            search_end=new_bounds[1],
+        )
+
+        assert "browser-c2" in result["orphaned"]
+        assert mcp_comments["browser-c2"]["orphaned"] is True
+
+        await asyncio.sleep(0.5)
+
+    # Verify orphaned flag synced
+    async with connect_peer(server, "test-orphan-integration") as text:
+        comments_map: Map = text.doc.get("comments", type=Map)
+        assert comments_map["browser-c2"]["orphaned"] is True
 
 
 def test_heading_level_detection():
