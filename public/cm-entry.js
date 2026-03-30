@@ -146,8 +146,10 @@ function init() {
 
       rebuild() {
         resolveRanges();
+        // Decorations must be added in strict from-position order
+        const decoRanges = [...commentRanges].sort((a, b) => a.from - b.from || a.to - b.to);
         const builder = new RangeSetBuilder();
-        for (const r of commentRanges) {
+        for (const r of decoRanges) {
           builder.add(r.from, r.to, commentMark);
         }
         this.decorations = builder.finish();
