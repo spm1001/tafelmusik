@@ -95,6 +95,11 @@ async def test_hydrate_empty_md_file(file_server):
 # --- Directory listing ---
 
 
+def _room_names(response_json) -> list[str]:
+    """Extract room names from list_rooms API response."""
+    return [r["name"] for r in response_json["rooms"]]
+
+
 async def test_list_rooms_includes_md_files(file_server):
     """list_rooms returns .md files from docs_dir."""
     port, docs_dir, _ = file_server
@@ -103,9 +108,9 @@ async def test_list_rooms_includes_md_files(file_server):
 
     async with httpx.AsyncClient() as client:
         r = await client.get(f"http://127.0.0.1:{port}/api/rooms")
-        rooms = r.json()["rooms"]
-        assert "alpha" in rooms
-        assert "beta" in rooms
+        names = _room_names(r.json())
+        assert "alpha" in names
+        assert "beta" in names
 
 
 async def test_list_rooms_includes_nested_md_files(file_server):
@@ -116,8 +121,8 @@ async def test_list_rooms_includes_nested_md_files(file_server):
 
     async with httpx.AsyncClient() as client:
         r = await client.get(f"http://127.0.0.1:{port}/api/rooms")
-        rooms = r.json()["rooms"]
-        assert "notes/daily" in rooms
+        names = _room_names(r.json())
+        assert "notes/daily" in names
 
 
 async def test_list_rooms_merges_file_and_memory(file_server):
@@ -132,9 +137,25 @@ async def test_list_rooms_merges_file_and_memory(file_server):
 
         async with httpx.AsyncClient() as client:
             r = await client.get(f"http://127.0.0.1:{port}/api/rooms")
-            rooms = r.json()["rooms"]
-            assert "on-disk" in rooms
-            assert "in-memory" in rooms
+            names = _room_names(r.json())
+            assert "on-disk" in names
+            assert "in-memory" in names
+
+
+async def test_list_rooms_active_flag(file_server):
+    """Active rooms are marked active, file-only rooms are not."""
+    port, docs_dir, _ = file_server
+    (docs_dir / "file-only.md").write_text("# File Only")
+
+    async with connect_peer(port, "live-room") as text:
+        text += "Active"
+        await asyncio.sleep(0.3)
+
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"http://127.0.0.1:{port}/api/rooms")
+            rooms_by_name = {r["name"]: r for r in r.json()["rooms"]}
+            assert rooms_by_name["live-room"]["active"] is True
+            assert rooms_by_name["file-only"]["active"] is False
 
 
 # --- Flush ---
@@ -229,15 +250,27 @@ async def test_round_trip_hydrate_edit_flush_rehydrate(file_server):
         edited = str(room_text)
         (docs_dir / "report.md").write_text(edited)
 
-    # Step 4: Room cleaned up
+    # Step 4: Room kept in memory (file-backed rooms aren't cleaned up)
     await asyncio.sleep(0.5)
-    assert "report" not in manager.rooms
+    assert "report" in manager.rooms  # preserved to avoid CRDT re-hydration duplication
 
-    # Step 5: Re-hydrate from the flushed file
+    # Step 5: Reconnect — uses in-memory room (same CRDT ops, no duplication)
     async with connect_peer(port, "report") as text:
         rehydrated = str(text)
         assert "Draft content." in rehydrated
         assert "New section added." in rehydrated
+
+
+async def test_path_traversal_rejected(file_server):
+    """Room names that escape docs_dir don't hydrate from outside files."""
+    port, docs_dir, manager = file_server
+    # Create a file outside docs_dir
+    (docs_dir.parent / "secret.md").write_text("sensitive data")
+
+    # Connect with a traversal room name — should get empty room, not the file
+    async with connect_peer(port, "../secret") as text:
+        content = str(text)
+        assert "sensitive data" not in content
 
 
 async def test_file_takes_priority_over_sqlite(file_server):

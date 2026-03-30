@@ -292,7 +292,8 @@ async def test_list_rooms_endpoint(server):
             response = await client.get(f"http://127.0.0.1:{server}/api/rooms")
             assert response.status_code == 200
             data = response.json()
-            assert "listed-room" in data["rooms"]
+            room_names = [r["name"] for r in data["rooms"]]
+            assert "listed-room" in room_names
 
 
 async def test_sync_timeout(tmp_path):

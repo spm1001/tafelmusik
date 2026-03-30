@@ -186,6 +186,14 @@ class RoomManager:
         self._docs_dir = docs_dir
         self.rooms: dict[str, Room] = {}
 
+    def _safe_doc_path(self, name: str) -> Path | None:
+        """Resolve a room name to a .md path, rejecting traversal attempts."""
+        md_path = (self._docs_dir / f"{name}.md").resolve()
+        if not md_path.is_relative_to(self._docs_dir.resolve()):
+            log.warning("Room name %r escapes docs_dir, rejected", name)
+            return None
+        return md_path
+
     async def get_room(self, name: str) -> Room:
         """Get or create a room, hydrating from .md file or SQLite.
 
@@ -193,8 +201,8 @@ class RoomManager:
         During migration, rooms without .md files fall back to SQLite.
         """
         if name not in self.rooms:
-            md_path = self._docs_dir / f"{name}.md"
-            if md_path.exists():
+            md_path = self._safe_doc_path(name)
+            if md_path is not None and md_path.exists():
                 doc = Doc()
                 text = doc.get("content", type=Text)
                 content = md_path.read_text()
@@ -212,9 +220,19 @@ class RoomManager:
         return self.rooms[name]
 
     async def remove_if_empty(self, name: str) -> None:
-        """Stop and remove a room if no clients are connected."""
+        """Stop and remove a room if no clients are connected.
+
+        File-backed rooms are kept in memory to preserve CRDT state
+        identity. Without this, WebSocket reconnections trigger re-hydration
+        from file which creates new CRDT operations — these merge with the
+        client's old state and duplicate content.
+        """
         room = self.rooms.get(name)
         if room and not room.channels:
+            md_path = self._safe_doc_path(name)
+            if md_path is not None and md_path.exists():
+                log.info("Room %s: last client left, keeping (file-backed)", name)
+                return
             del self.rooms[name]
             await room.stop()
             log.info("Room %s: cleaned up (no clients)", name)
@@ -282,12 +300,22 @@ def create_app(
         }
 
     async def list_rooms(request):
-        """Return room names from in-memory rooms, SQLite store, and .md files."""
+        """Return room names from in-memory rooms, SQLite store, and .md files.
+
+        Each room includes an ``active`` flag: true if the room is currently
+        in memory with connected clients (excluding the MCP poller's own
+        connections). The room poller uses this to avoid connecting to every
+        file on disk.
+        """
         memory_rooms = set(manager.rooms.keys())
         persisted_rooms = await asyncio.to_thread(_query_persisted_rooms)
         file_rooms = await asyncio.to_thread(_scan_doc_files)
-        all_rooms = sorted(memory_rooms | persisted_rooms | file_rooms)
-        return JSONResponse({"rooms": all_rooms})
+        all_names = sorted(memory_rooms | persisted_rooms | file_rooms)
+        rooms = [
+            {"name": name, "active": name in memory_rooms}
+            for name in all_names
+        ]
+        return JSONResponse({"rooms": rooms})
 
     @asynccontextmanager
     async def lifespan(app):

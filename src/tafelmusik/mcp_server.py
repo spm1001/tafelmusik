@@ -315,6 +315,7 @@ class AppState:
     sync_timeout: float = 10.0
     keepalive: float | None = 60.0
     session: ServerSession | None = None
+    docs_dir: Path | None = None
 
     async def connect(self, room: str) -> RoomConnection:
         """Get or create a connection to a room.
@@ -432,20 +433,30 @@ class AppState:
         self._poll_task = asyncio.create_task(self._poll_rooms())
 
     async def _poll_rooms(self) -> None:
-        """Poll the ASGI server for rooms and connect to any new ones."""
+        """Poll the ASGI server for active rooms and connect to new ones.
+
+        Only connects to rooms marked ``active`` (have clients connected on
+        the server). File-only rooms are listed but not connected — avoids
+        opening a WebSocket per .md file in the docs directory.
+        """
         http_url = _ws_to_http(self.server_url)
         while True:
             try:
                 response = await self.client.get(f"{http_url}/api/rooms")
                 response.raise_for_status()
                 rooms = response.json().get("rooms", [])
-                for room in rooms:
-                    if room not in self.rooms:
+                for entry in rooms:
+                    # Support both old format (string) and new format (dict)
+                    if isinstance(entry, str):
+                        name, active = entry, True
+                    else:
+                        name, active = entry["name"], entry.get("active", True)
+                    if active and name not in self.rooms:
                         try:
-                            await self.connect(room)
-                            log.info("Room poller: connected to %s", room)
+                            await self.connect(name)
+                            log.info("Room poller: connected to %s", name)
                         except (ConnectionError, TimeoutError):
-                            log.debug("Room poller: failed to connect to %s", room)
+                            log.debug("Room poller: failed to connect to %s", name)
             except Exception:
                 log.debug("Room poller: server unreachable, will retry")
             await asyncio.sleep(self._poll_interval)
@@ -460,6 +471,29 @@ class AppState:
         for conn in self.rooms.values():
             await conn.close()
         self.rooms.clear()
+
+
+# --- Docs directory helpers ---
+
+
+def _get_docs_dir(state: AppState) -> Path:
+    """Get docs_dir from ASGI server config, cached on AppState."""
+    if state.docs_dir is not None:
+        return state.docs_dir
+    # Fall back to env var (same source the ASGI server uses)
+    default = Path(__file__).resolve().parent.parent.parent / "docs"
+    state.docs_dir = Path(os.environ.get("TAFELMUSIK_DOCS_DIR", default))
+    return state.docs_dir
+
+
+def _find_git_root(path: Path) -> Path | None:
+    """Walk up from path to find a .git directory."""
+    current = path.resolve()
+    while current != current.parent:
+        if (current / ".git").exists():
+            return current
+        current = current.parent
+    return None
 
 
 # --- FastMCP setup ---
@@ -680,7 +714,15 @@ async def list_docs(ctx: Context) -> str:
         rooms = data.get("rooms", [])
         if not rooms:
             return "No documents found."
-        return "Documents:\n" + "\n".join(f"  - {r}" for r in rooms)
+        lines = []
+        for entry in rooms:
+            if isinstance(entry, str):
+                lines.append(f"  - {entry}")
+            else:
+                name = entry["name"]
+                marker = " (active)" if entry.get("active") else ""
+                lines.append(f"  - {name}{marker}")
+        return "Documents:\n" + "\n".join(lines)
     except httpx.HTTPError:
         return "Could not list documents (is the Tafelmusik server running?)"
 
@@ -700,9 +742,10 @@ async def flush_doc(room: str, ctx: Context) -> str:
     conn = await state.connect(room)
 
     content = str(conn.text)
-    default_docs = Path(__file__).resolve().parent.parent.parent / "docs"
-    docs_dir = Path(os.environ.get("TAFELMUSIK_DOCS_DIR", default_docs))
-    md_path = docs_dir / f"{room}.md"
+    docs_dir = _get_docs_dir(state)
+    md_path = (docs_dir / f"{room}.md").resolve()
+    if not md_path.is_relative_to(docs_dir.resolve()):
+        return f"Room name '{room}' escapes docs directory — rejected."
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(content)
 
@@ -714,24 +757,29 @@ async def flush_doc(room: str, ctx: Context) -> str:
             for key in comment_keys:
                 del comments_map[key]
 
-    # Git commit the file
-    git_msg = f"flush: {room}"
-    try:
-        subprocess.run(
-            ["git", "add", str(md_path)],
-            cwd=str(docs_dir),
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "commit", "-m", git_msg, "--", str(md_path)],
-            cwd=str(docs_dir),
-            check=True,
-            capture_output=True,
-        )
-        git_status = " Git committed."
-    except subprocess.CalledProcessError:
-        git_status = " Git commit skipped (no changes or not a repo)."
+    # Git commit the file (only if docs_dir is inside a git repo)
+    git_status = ""
+    repo_root = _find_git_root(docs_dir)
+    if repo_root:
+        git_msg = f"flush: {room}"
+        try:
+            subprocess.run(
+                ["git", "add", str(md_path)],
+                cwd=str(repo_root),
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", git_msg, "--", str(md_path)],
+                cwd=str(repo_root),
+                check=True,
+                capture_output=True,
+            )
+            git_status = " Git committed."
+        except subprocess.CalledProcessError:
+            git_status = " Git commit skipped (no changes)."
+    else:
+        git_status = " No git repo found — skipped commit."
 
     wiped = len(comment_keys)
     comment_note = f" {wiped} comment(s) cleared." if wiped else ""
