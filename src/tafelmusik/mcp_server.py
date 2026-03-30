@@ -325,9 +325,13 @@ async def _comment_consumer(
                     exc_info=True,
                 )
 
-        # Reset snapshot after pushing (whether comment-only or resync)
+        # Reset snapshot after high-drift push and cancel idle timer
+        # (prevents a redundant resync if the timer fires before next edit)
         if high_drift:
             _reset_snapshot(conn, room)
+            if conn._idle_timer is not None:
+                conn._idle_timer.cancel()
+                conn._idle_timer = None
 
 
 # --- Connection management ---
@@ -625,6 +629,7 @@ class AppState:
         for conn in self.rooms.values():
             await conn.close()
         self.rooms.clear()
+        self.room_snapshots.clear()
 
 
 # --- Docs directory helpers ---
