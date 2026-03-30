@@ -62,7 +62,8 @@ Mac setup (one-time): `git remote add hezza modha@hezza:Repos/batterie/tafelmusi
 - **Persistence:** SQLiteYStore stores updates (not documents). Squashing disabled (pycrdt-store 0.1.3 data-loss bug, see `.bon/understanding.md`). Re-enable after upstream fix ships.
 - **Version:** Single source in `.claude-plugin/plugin.json`.
 - **Tests:** Adjacent to source (`*_test.py`). pytest + pytest-asyncio.
-- **Comments:** Point + quote architecture. Single StickyIndex anchor + stored quote text. Re-anchor by text search after replace_section.
+- **Comments:** Y.Map "comments" in Y.Doc, each entry a nested Y.Map. Three anchor fields: `anchorStart`/`anchorEnd` (RelativePosition range, tracks live edits), `anchor` (single point, fallback after replace_section), `quote` (text for re-anchoring when positions collapse). Don't remove `anchor` thinking it's redundant — it's the fallback. Frontend sorts by overlap (same conversation = chronological), decorations sort by strict position (RangeSetBuilder requirement). Browser uses `Y.createRelativePositionFromTypeIndex`, MCP uses `StickyIndex.to_json()` — both produce compatible `{item: {client, clock}, assoc}` JSON.
+- **Comments UI state machine:** Two modes — `document` (editing) and `commenting` (compose card visible). Card clicks use CM6 `Annotation` to mark programmatic selections, preventing false transitions. See `cm-entry.js`.
 
 ## Gotchas
 
