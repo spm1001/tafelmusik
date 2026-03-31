@@ -67,7 +67,7 @@ function init() {
     composeQuoteEl.textContent = sel.text;
     composeCard.style.display = "block";
     positionComposeCard();
-    requestAnimationFrame(() => composeView.focus());
+    // Focus stays in editor — click compose card to write a comment.
   }
 
   function enterDocument() {
@@ -233,7 +233,7 @@ function init() {
 
   const composeHint = document.createElement("div");
   composeHint.className = "compose-hint";
-  composeHint.textContent = "\u2318\u21A9 or Shift\u21A9 to comment \u00B7 Esc to cancel";
+  composeHint.textContent = "\u2318\u21A9 to send \u00B7 Esc to cancel";
 
   composeCard.append(composeQuoteEl, composeEditorWrap, composeHint);
 
