@@ -38,6 +38,9 @@ function init() {
     const el = document.getElementById("connection-status");
     el.textContent = status === "connected" ? "connected" : status;
     el.className = "status " + status;
+    if (status !== "connected") {
+      console.warn("[tfm] connection status:", status, new Error().stack);
+    }
   });
 
   // --- UI state machine ---
@@ -191,13 +194,23 @@ function init() {
       },
     };
 
+    // Debounce the Y.Map observer — a single ydoc.transact() that sets
+    // multiple fields fires observeDeep once per field. Without debouncing,
+    // each field triggers rebuild + renderComments + dispatch, causing DOM
+    // thrashing that blocks the main thread long enough to blip the WebSocket.
+    let observerTimer = null;
     const observer = () => {
       if (!alive) return;
-      plugin.rebuild();
-      const wasCommenting = mode === "commenting";
-      renderComments();
-      if (wasCommenting) requestAnimationFrame(() => composeView.focus());
-      try { v.dispatch({}); } catch (e) {}
+      if (observerTimer) return; // already scheduled
+      observerTimer = requestAnimationFrame(() => {
+        observerTimer = null;
+        if (!alive) return;
+        plugin.rebuild();
+        const wasCommenting = mode === "commenting";
+        renderComments();
+        if (wasCommenting) composeView.focus();
+        try { v.dispatch({}); } catch (e) {}
+      });
     };
     comments.observeDeep(observer);
 
@@ -300,7 +313,9 @@ function init() {
   function renderComments() {
     const ranges = commentRanges;
 
-    if (composeCard.parentNode) composeCard.remove();
+    // Detach compose card before clearing — prevents destroying its CM6 instance
+    const hadCompose = composeCard.parentNode === commentsList;
+    if (hadCompose) composeCard.remove();
     commentsList.innerHTML = "";
 
     if (ranges.length === 0 && mode === "document") {
