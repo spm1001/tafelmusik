@@ -291,14 +291,32 @@ def create_app(
         except Exception:
             return set()  # DB may not exist yet
 
+    # Directories skipped when scanning docs_dir for .md files.
+    # Dotdirs (.bon, .claude, .git), dependency dirs, and build artifacts
+    # contain markdown that isn't authored content.
+    _SKIP_DIRS = frozenset({
+        "node_modules", "__pycache__", ".venv", "venv",
+        "dist", "build", "_build", ".tox", ".mypy_cache",
+        ".hypothesis", "htmlcov", "site-packages",
+    })
+
     def _scan_doc_files() -> set[str]:
-        """Scan docs_dir for .md files, returning room names."""
+        """Scan docs_dir for authored .md files, returning room names.
+
+        Skips dotdirs (e.g. .git, .bon, .claude), dependency dirs, and
+        build artifacts. These contain markdown but aren't documents
+        you'd want to edit collaboratively.
+        """
         if not _docs_dir.exists():
             return set()
-        return {
-            str(md.relative_to(_docs_dir).with_suffix(""))
-            for md in _docs_dir.rglob("*.md")
-        }
+        results = set()
+        for md in _docs_dir.rglob("*.md"):
+            rel = md.relative_to(_docs_dir)
+            # Skip any path component starting with '.' or in the skip list
+            if any(p.startswith(".") or p in _SKIP_DIRS for p in rel.parts[:-1]):
+                continue
+            results.add(str(rel.with_suffix("")))
+        return results
 
     async def list_rooms(request):
         """Return room names from in-memory rooms, SQLite store, and .md files.

@@ -427,6 +427,24 @@ function init() {
     filesPane.classList.add("collapsed");
   });
 
+  // Resize handle
+  const filesResize = document.getElementById("files-resize");
+  filesResize.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    filesResize.classList.add("dragging");
+    const onMove = (e) => {
+      const w = Math.max(160, Math.min(e.clientX, window.innerWidth / 2));
+      filesPane.style.width = w + "px";
+    };
+    const onUp = () => {
+      filesResize.classList.remove("dragging");
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+
   // Recently accessed — stored in localStorage
   function getRecents() {
     try { return JSON.parse(localStorage.getItem("tfm-recents") || "[]"); } catch { return []; }

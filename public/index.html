@@ -13,7 +13,9 @@
 
     /* Split layout — each pane scrolls independently */
     .editor-layout { display: flex; height: 100vh; }
-    #files-pane { width: 220px; border-right: 1px solid #eee; overflow-y: auto; background: #fafafa; font-size: 0.8rem; flex-shrink: 0; }
+    #files-pane { width: 240px; min-width: 160px; max-width: 50vw; border-right: 1px solid #eee; overflow-y: auto; background: #fafafa; font-size: 0.8rem; flex-shrink: 0; }
+    #files-resize { width: 4px; cursor: col-resize; background: transparent; flex-shrink: 0; }
+    #files-resize:hover, #files-resize.dragging { background: #cbd5e1; }
     #files-pane.collapsed { display: none; }
     .files-header { padding: 0.5rem 0.75rem; font-weight: 600; font-size: 0.75rem; color: #666; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eee; }
     .files-header button { background: none; border: none; cursor: pointer; color: #999; font-size: 0.9rem; padding: 0 4px; }
@@ -90,6 +92,7 @@
       <input type="text" id="files-search" placeholder="Search or create..." />
       <div class="files-tree" id="files-tree"></div>
     </div>
+    <div id="files-resize"></div>
     <div id="editor-pane"></div>
     <div id="comments-pane">
       <div id="comments-list"></div>
