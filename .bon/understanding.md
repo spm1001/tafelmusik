@@ -111,3 +111,7 @@ Bons capture what (--what) and why (--why) per action, but not the execution ord
 ## Token efficiency insight
 
 CRDTs are already more token-efficient than a file-based approach would be. The CRDT pushes diffs over the wire — adding a file layer on top would mean hauling full file content in and out of context. The drift threshold (how much CRDT state can diverge from the file before forcing a resync) is a Goldilocks problem: too low = wasted resync tokens, too high = wasted failed-edit tokens. Comments serve as turn signals rather than continuous notifications — comment events notify Claude, not every keystroke.
+
+## Working pattern: review while context is hot
+
+The review-then-fix loop — asking "what did we miss, what could be better, what might go wrong" immediately after implementing, before committing — catches real issues that would otherwise become fix-up bons. Examples from Phase 2: consumer task not awaited on cancellation, no drift logging for threshold tuning, orphaned `_cached_content` field. The cost is 5 minutes of re-reading; the payoff is shipping cleaner code in the same session. Review while context is hot is qualitatively different from review after the fact — you see things in code you just wrote that you'd miss coming back cold.

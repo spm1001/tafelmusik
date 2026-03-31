@@ -284,13 +284,26 @@ async def _comment_consumer(
             except TimeoutError:
                 break
 
-        if conn._app_state is None or conn._app_state.session is None:
-            log.info(
-                "Room %s: %d comment(s) arrived but no MCP session yet",
-                room,
-                len(events),
-            )
+        if conn._app_state is None:
             continue
+
+        # Wait for session — captured at initialization via _handle_message
+        # wrapper, or on first tool call via _get_state. Comments arriving
+        # before session capture queue here instead of being dropped.
+        if conn._app_state.session is None:
+            try:
+                await asyncio.wait_for(
+                    conn._app_state.session_ready.wait(),
+                    timeout=conn._app_state.session_timeout,
+                )
+            except TimeoutError:
+                log.warning(
+                    "Room %s: %d comment(s) dropped — no MCP session after %.0fs",
+                    room,
+                    len(events),
+                    conn._app_state.session_timeout,
+                )
+                continue
 
         drift = _compute_drift(conn, room)
         high_drift = drift > DRIFT_THRESHOLD
@@ -417,8 +430,29 @@ class AppState:
     sync_timeout: float = 10.0
     keepalive: float | None = 60.0
     idle_timeout: float | None = IDLE_TIMEOUT
-    session: ServerSession | None = None
+    session_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    session_timeout: float = 30.0
     docs_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        self._session: ServerSession | None = None
+
+    @property
+    def session(self) -> ServerSession | None:
+        return self._session
+
+    @session.setter
+    def session(self, value: ServerSession | None) -> None:
+        """Capture the MCP session and signal readiness.
+
+        Set from _handle_message wrapper (early, at initialization) or
+        from _get_state (fallback, on first tool call). Idempotent — only
+        the first non-None assignment takes effect.
+        """
+        if self._session is None and value is not None:
+            self._session = value
+            self.session_ready.set()
+            log.info("Captured MCP session for channel notifications")
 
     async def connect(self, room: str) -> RoomConnection:
         """Get or create a connection to a room.
@@ -690,11 +724,43 @@ def _init_options_with_channel(**kwargs):
 
 mcp._mcp_server.create_initialization_options = _init_options_with_channel
 
+
+def _install_session_capture(server_instance) -> None:
+    """Wrap Server._handle_message to capture ServerSession at initialization.
+
+    The MCP SDK creates ServerSession in Server.run() and passes it to
+    _handle_message on every message. The first message is the
+    InitializedNotification — by capturing session there, it's available
+    before any tool call. This fixes the gap where comments on new docs
+    (never touched by a tool call) were silently dropped.
+
+    Private API: Server._handle_message (mcp 1.26.0)
+    Validated: server/lowlevel/server.py:685
+    """
+    assert hasattr(server_instance, "_handle_message"), (
+        "Server._handle_message not found — MCP SDK API may have changed"
+    )
+    _original = server_instance._handle_message
+    _captured = False
+
+    async def _capturing(message, session, lifespan_context, raise_exceptions=False, **kwargs):
+        nonlocal _captured
+        if not _captured and hasattr(lifespan_context, "session_ready"):
+            lifespan_context.session = session  # property setter handles signalling
+            _captured = True
+        return await _original(message, session, lifespan_context, raise_exceptions, **kwargs)
+
+    server_instance._handle_message = _capturing
+
+
+_install_session_capture(mcp._mcp_server)
+
+
 def _get_state(ctx: Context) -> AppState:
     state = ctx.request_context.lifespan_context
-    if state.session is None:
-        state.session = ctx.request_context.session
-        log.info("Captured MCP session for channel notifications")
+    # Fallback: capture session on tool call if _handle_message wrapper
+    # didn't fire (e.g., MCP SDK changed). Property setter is idempotent.
+    state.session = ctx.request_context.session
     return state
 
 

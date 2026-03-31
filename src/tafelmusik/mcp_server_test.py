@@ -58,6 +58,7 @@ async def make_state(port, poll_interval=None, **kwargs):
             server_url=f"ws://127.0.0.1:{port}",
             keepalive=None,  # No keepalive in tests
             idle_timeout=kwargs.pop("idle_timeout", None),  # Explicit opt-in
+            session_timeout=kwargs.pop("session_timeout", 30.0),
             **kwargs,
         )
         if poll_interval is not None:
@@ -861,6 +862,61 @@ class MockSession:
         self.messages.append(message)
 
 
+async def test_session_property_signals_ready():
+    """Setting session property captures session and signals session_ready."""
+    async with httpx.AsyncClient() as client:
+        state = AppState(
+            client=client,
+            server_url="ws://127.0.0.1:1",
+            keepalive=None,
+            idle_timeout=None,
+        )
+        assert state.session is None
+        assert not state.session_ready.is_set()
+
+        mock = MockSession()
+        state.session = mock
+
+        assert state.session is mock
+        assert state.session_ready.is_set()
+
+        # Idempotent — second assignment doesn't overwrite
+        mock2 = MockSession()
+        state.session = mock2
+        assert state.session is mock  # still the first one
+
+
+async def test_install_session_capture():
+    """_install_session_capture wraps _handle_message to capture session."""
+    from tafelmusik.mcp_server import _install_session_capture
+
+    calls = []
+
+    class FakeServer:
+        async def _handle_message(self, message, session, lifespan_context, raise_exceptions=False):
+            calls.append((message, session))
+
+    server = FakeServer()
+    _install_session_capture(server)
+
+    async with httpx.AsyncClient() as client:
+        state = AppState(
+            client=client,
+            server_url="ws://127.0.0.1:1",
+            keepalive=None,
+            idle_timeout=None,
+        )
+        mock = MockSession()
+
+        # Simulate first message (InitializedNotification) — session captured via property
+        await server._handle_message("init-msg", mock, state)
+
+        assert state.session is mock
+        assert state.session_ready.is_set()
+        assert len(calls) == 1  # original was called
+        assert calls[0] == ("init-msg", mock)
+
+
 async def test_send_channel_notification_format():
     """_send_channel_notification sends correctly shaped JSONRPCNotification."""
     session = MockSession()
@@ -913,10 +969,41 @@ async def test_comment_notification_sent_to_session(server):
         assert notification.params["meta"]["room"] == "comment-notify-test"
 
 
-async def test_no_comment_notification_without_session(server):
-    """Without a captured session, comments are gracefully skipped — no crash."""
+async def test_comment_waits_for_session(server):
+    """Comment consumer waits for session instead of dropping."""
+    mock_session = MockSession()
+
     async with make_state(server) as state:
-        # Don't set state.session — leave it None
+        # session is None — consumer should wait, not drop
+        conn = await state.connect("wait-for-session-test")
+        conn.text += "Hello world"
+
+        with conn.doc.transaction():
+            c = Map()
+            conn.comments_map["sameer-1"] = c
+            c["author"] = "sameer"
+            c["quote"] = "Hello"
+            c["body"] = "fix this"
+            c["resolved"] = False
+
+        # Consumer is waiting for session — no notification yet
+        await asyncio.sleep(1.0)
+        assert len(mock_session.messages) == 0
+
+        # Set session — consumer should deliver
+        state.session = mock_session
+        await asyncio.sleep(1.5)
+
+        assert len(mock_session.messages) > 0
+        notification = mock_session.messages[0].message.root
+        assert notification.method == "notifications/claude/channel"
+        assert "fix this" in notification.params["content"]
+
+
+async def test_comment_dropped_when_session_times_out(server):
+    """Without a captured session after timeout, comments are dropped gracefully."""
+    async with make_state(server, session_timeout=1.0) as state:
+        # Don't set session — leave it None
         conn = await state.connect("no-session-test")
         conn.text += "Hello world"
 
@@ -928,10 +1015,10 @@ async def test_no_comment_notification_without_session(server):
             c["body"] = "fix this"
             c["resolved"] = False
 
-        # Wait for consumer
-        await asyncio.sleep(1.5)
+        # Wait for timeout (1s) + consumer debounce (0.5s) + margin
+        await asyncio.sleep(3.0)
 
-        # No crash — graceful handling (logged, not sent)
+        # Comment was dropped (no session after timeout) — no crash
         assert conn._comment_queue.empty()
 
 
