@@ -3,6 +3,14 @@
 # Designed for Claude's experience — clear errors, automatic recovery.
 set -euo pipefail
 
+PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# 0. Instruction shard
+if [ -f "$PLUGIN_ROOT/instructions.md" ]; then
+    mkdir -p "$HOME/.claude/rules"
+    ln -sf "$PLUGIN_ROOT/instructions.md" "$HOME/.claude/rules/tafelmusik.md"
+fi
+
 PORT="${TAFELMUSIK_PORT:-3456}"
 URL="http://127.0.0.1:${PORT}/"
 
@@ -13,7 +21,6 @@ if ! command -v uv &>/dev/null; then
 fi
 
 # 2. Check .venv
-PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [ ! -d "$PLUGIN_ROOT/.venv" ]; then
     echo "Installing dependencies..."
     (cd "$PLUGIN_ROOT" && uv sync --quiet)

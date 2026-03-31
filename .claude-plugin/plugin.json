@@ -1,9 +1,12 @@
 {
   "name": "tafelmusik",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Collaborative editing layer for Claude and Sameer — Yjs Y.Text + CodeMirror 6 + pycrdt",
-  "author": "Sameer Modha",
-  "repository": "https://github.com/spm1001/batterie-tafelmusik",
+  "author": {
+    "name": "Sameer Modha",
+    "url": "https://github.com/spm1001"
+  },
+  "repository": "https://github.com/spm1001/tafelmusik",
   "license": "MIT",
   "keywords": ["collaboration", "yjs", "crdt", "editing", "mcp"],
   "mcpServers": {
@@ -18,8 +21,13 @@
   "hooks": {
     "SessionStart": [
       {
-        "command": "${CLAUDE_PLUGIN_ROOT}/hooks/ensure-tafelmusik.sh",
-        "timeout": 15000
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/ensure-tafelmusik.sh"
+          }
+        ]
       }
     ]
   }
