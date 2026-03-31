@@ -31,8 +31,11 @@
     .dir-group.collapsed > :not(.dir-item) { display: none; }
     .files-toggle { position: fixed; top: 0.5rem; left: 0.5rem; z-index: 10; background: none; border: none; cursor: pointer; font-size: 1rem; color: #999; padding: 2px; }
     .files-toggle:hover { color: #333; }
-    #new-doc-input { width: calc(100% - 1.5rem); margin: 0.5rem 0.75rem; padding: 4px 6px; font-size: 0.75rem; border: 1px solid #ddd; border-radius: 4px; }
-    #new-doc-input::placeholder { color: #aaa; }
+    #files-search { width: calc(100% - 1.5rem); margin: 0.5rem 0.75rem; padding: 4px 6px; font-size: 0.75rem; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+    #files-search::placeholder { color: #aaa; }
+    .files-section { padding: 0.25rem 0; }
+    .files-section-label { padding: 4px 0.75rem; font-size: 0.65rem; font-weight: 600; color: #999; text-transform: uppercase; letter-spacing: 0.5px; }
+    .search-hint { padding: 0.5rem 0.75rem; font-size: 0.75rem; color: #999; font-style: italic; }
     #editor-pane { flex: 1; min-width: 0; overflow: hidden; }
     #comments-pane { flex: 1; min-width: 0; border-left: 1px solid #eee; overflow-y: auto; background: #fafafa; display: flex; flex-direction: column; }
     #comments-list { flex: 1; overflow-y: auto; padding: 1rem; padding-bottom: 50vh; }
@@ -84,7 +87,7 @@
         <span>Documents</span>
         <button id="files-close" title="Close">&times;</button>
       </div>
-      <input type="text" id="new-doc-input" placeholder="new/document/path" />
+      <input type="text" id="files-search" placeholder="Search or create..." />
       <div class="files-tree" id="files-tree"></div>
     </div>
     <div id="editor-pane"></div>

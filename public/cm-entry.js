@@ -418,23 +418,13 @@ function init() {
   const filesTree = document.getElementById("files-tree");
   const filesToggle = document.getElementById("files-toggle");
   const filesClose = document.getElementById("files-close");
-  const newDocInput = document.getElementById("new-doc-input");
+  const filesSearch = document.getElementById("files-search");
 
   filesToggle.addEventListener("click", () => {
     filesPane.classList.toggle("collapsed");
   });
   filesClose.addEventListener("click", () => {
     filesPane.classList.add("collapsed");
-  });
-
-  newDocInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      const path = newDocInput.value.trim().replace(/\.md$/, "");
-      if (path) {
-        addRecent(path);
-        window.location.pathname = "/" + path;
-      }
-    }
   });
 
   // Recently accessed — stored in localStorage
@@ -448,92 +438,102 @@ function init() {
     localStorage.setItem("tfm-recents", JSON.stringify(recents));
   }
 
-  // Record current room as recent
   if (room !== "default") addRecent(room);
 
-  function buildTree(rooms) {
-    const tree = {};
-    for (const r of rooms) {
-      const parts = r.name.split("/");
-      let node = tree;
-      for (let i = 0; i < parts.length - 1; i++) {
-        if (!node[parts[i]]) node[parts[i]] = {};
-        node = node[parts[i]];
+  let allRooms = [];
+
+  function makeFileItem(r) {
+    const item = document.createElement("div");
+    item.className = "file-item" + (r.name === room ? " current" : "");
+
+    const dot = document.createElement("span");
+    dot.className = "dot " + (r.active ? "active" : "inactive");
+    item.appendChild(dot);
+
+    const label = document.createElement("span");
+    label.textContent = r.name;
+    item.appendChild(label);
+
+    item.addEventListener("click", () => {
+      addRecent(r.name);
+      window.location.pathname = "/" + r.name;
+    });
+    return item;
+  }
+
+  function renderFileList() {
+    const query = filesSearch.value.trim().toLowerCase();
+    filesTree.innerHTML = "";
+
+    if (query) {
+      // Search mode — filter all rooms, show up to 30 matches
+      const matches = allRooms.filter((r) => r.name.toLowerCase().includes(query)).slice(0, 30);
+      if (matches.length) {
+        for (const r of matches) filesTree.appendChild(makeFileItem(r));
+      } else {
+        const hint = document.createElement("div");
+        hint.className = "search-hint";
+        hint.textContent = "No matches. Enter to create.";
+        filesTree.appendChild(hint);
       }
-      node["__file:" + parts[parts.length - 1]] = r;
-    }
-    return tree;
-  }
-
-  function renderTree(node, container, depth) {
-    const dirs = [];
-    const files = [];
-    for (const key of Object.keys(node).sort()) {
-      if (key.startsWith("__file:")) files.push({key: key.slice(7), data: node[key]});
-      else dirs.push(key);
+      return;
     }
 
-    for (const dir of dirs) {
-      const group = document.createElement("div");
-      group.className = "dir-group";
+    // Default: active rooms + recents
+    const recents = getRecents();
+    const active = allRooms.filter((r) => r.active);
+    const roomMap = new Map(allRooms.map((r) => [r.name, r]));
 
+    if (active.length) {
+      const section = document.createElement("div");
+      section.className = "files-section";
       const label = document.createElement("div");
-      label.className = "dir-item";
-      label.style.paddingLeft = (0.75 + depth * 0.75) + "rem";
-      label.textContent = (group.classList.contains("collapsed") ? "\u25B6 " : "\u25BC ") + dir;
-      label.addEventListener("click", () => {
-        group.classList.toggle("collapsed");
-        label.textContent = (group.classList.contains("collapsed") ? "\u25B6 " : "\u25BC ") + dir;
-      });
-
-      group.appendChild(label);
-      renderTree(node[dir], group, depth + 1);
-      container.appendChild(group);
+      label.className = "files-section-label";
+      label.textContent = "Active";
+      section.appendChild(label);
+      for (const r of active) section.appendChild(makeFileItem(r));
+      filesTree.appendChild(section);
     }
 
-    for (const file of files) {
-      const item = document.createElement("div");
-      item.className = "file-item";
-      if (file.data.name === room) item.classList.add("current");
-      item.style.paddingLeft = (0.75 + depth * 0.75) + "rem";
+    const recentRooms = recents
+      .filter((name) => roomMap.has(name) && !roomMap.get(name).active)
+      .map((name) => roomMap.get(name));
+    if (recentRooms.length) {
+      const section = document.createElement("div");
+      section.className = "files-section";
+      const label = document.createElement("div");
+      label.className = "files-section-label";
+      label.textContent = "Recent";
+      section.appendChild(label);
+      for (const r of recentRooms) section.appendChild(makeFileItem(r));
+      filesTree.appendChild(section);
+    }
 
-      const dot = document.createElement("span");
-      dot.className = "dot " + (file.data.active ? "active" : "inactive");
-      item.appendChild(dot);
-
-      const name = document.createElement("span");
-      name.textContent = file.key;
-      item.appendChild(name);
-
-      item.addEventListener("click", () => {
-        addRecent(file.data.name);
-        window.location.pathname = "/" + file.data.name;
-      });
-
-      container.appendChild(item);
+    if (!active.length && !recentRooms.length) {
+      const hint = document.createElement("div");
+      hint.className = "search-hint";
+      hint.textContent = "Type to search documents";
+      filesTree.appendChild(hint);
     }
   }
+
+  filesSearch.addEventListener("input", renderFileList);
+  filesSearch.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      const path = filesSearch.value.trim().replace(/\.md$/, "");
+      if (path) {
+        addRecent(path);
+        window.location.pathname = "/" + path;
+      }
+    }
+  });
 
   async function refreshFiles() {
     try {
       const res = await fetch("/api/rooms");
       const data = await res.json();
-      const rooms = data.rooms || [];
-
-      // Sort: recents first, then alphabetical
-      const recents = getRecents();
-      rooms.sort((a, b) => {
-        const ai = recents.indexOf(a.name);
-        const bi = recents.indexOf(b.name);
-        if (ai !== -1 && bi !== -1) return ai - bi;
-        if (ai !== -1) return -1;
-        if (bi !== -1) return 1;
-        return a.name.localeCompare(b.name);
-      });
-
-      filesTree.innerHTML = "";
-      const tree = buildTree(rooms);
-      renderTree(tree, filesTree, 0);
+      allRooms = data.rooms || [];
+      renderFileList();
     } catch (e) {}
   }
 
