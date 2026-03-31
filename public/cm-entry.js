@@ -407,10 +407,59 @@ function init() {
     }
   }
 
+  // --- Markdown formatting shortcuts ---
+
+  function wrapSelection(v, before, after) {
+    const {from, to} = v.state.selection.main;
+    if (from === to) {
+      // No selection — insert markers with cursor between
+      v.dispatch({changes: {from, insert: before + after}, selection: {anchor: from + before.length}});
+    } else {
+      // Wrap selection — check if already wrapped, toggle off if so
+      const doc = v.state.doc;
+      const selText = doc.sliceString(from, to);
+      const preBefore = doc.sliceString(Math.max(0, from - before.length), from);
+      const postAfter = doc.sliceString(to, Math.min(doc.length, to + after.length));
+      if (preBefore === before && postAfter === after) {
+        // Already wrapped — unwrap
+        v.dispatch({changes: [
+          {from: from - before.length, to: from, insert: ""},
+          {from: to, to: to + after.length, insert: ""},
+        ], selection: {anchor: from - before.length, head: to - before.length}});
+      } else {
+        v.dispatch({changes: [
+          {from, insert: before},
+          {from: to, insert: after},
+        ], selection: {anchor: from + before.length, head: to + before.length}});
+      }
+    }
+    return true;
+  }
+
+  function prefixLine(v, prefix) {
+    const {from} = v.state.selection.main;
+    const line = v.state.doc.lineAt(from);
+    if (line.text.startsWith(prefix)) {
+      v.dispatch({changes: {from: line.from, to: line.from + prefix.length, insert: ""}});
+    } else {
+      v.dispatch({changes: {from: line.from, insert: prefix}});
+    }
+    return true;
+  }
+
+  const markdownKeymap = keymap.of([
+    {key: "Mod-b", run: (v) => wrapSelection(v, "**", "**")},
+    {key: "Mod-i", run: (v) => wrapSelection(v, "_", "_")},
+    {key: "Mod-Shift-x", run: (v) => wrapSelection(v, "~~", "~~")},
+    {key: "Mod-e", run: (v) => wrapSelection(v, "`", "`")},
+    {key: "Mod-Shift-.", run: (v) => prefixLine(v, "> ")},
+  ]);
+
   // --- Editor ---
 
   view = new EditorView({
     extensions: [
+      markdownKeymap,
       basicSetup,
       markdown(),
       syntaxHighlighting(headingStyle),
