@@ -22,13 +22,14 @@ from pycrdt import (
 from pycrdt.store import SQLiteYStore
 from pycrdt.store.base import YDocNotFound
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 PORT = 3456
 ROOT = Path(__file__).resolve().parent.parent.parent
+HOME = Path.home()
 
 # Uvicorn configures its own loggers but not root. basicConfig adds a
 # root handler so our lifecycle logs reach stderr (and journalctl).
@@ -256,7 +257,7 @@ def create_app(
 
     _db_path = str(db_path)
     _docs_dir = Path(docs_dir) if docs_dir else Path(
-        os.environ.get("TAFELMUSIK_DOCS_DIR", ROOT / "docs")
+        os.environ.get("TAFELMUSIK_DOCS_DIR", HOME / "Repos")
     )
     Store = type(
         "Store",
@@ -324,12 +325,20 @@ def create_app(
         finally:
             await manager.close()
 
+    _public_dir = str(public_dir)
+
+    async def spa_fallback(request):
+        """Serve index.html for any path not matched by API/WS/static routes."""
+        return FileResponse(Path(_public_dir) / "index.html")
+
     app = Starlette(
         lifespan=lifespan,
         routes=[
             Route("/api/rooms", list_rooms),
-            WebSocketRoute("/{room:path}", websocket_endpoint),
-            Mount("/", StaticFiles(directory=str(public_dir), html=True)),
+            WebSocketRoute("/_ws/{room:path}", websocket_endpoint),
+            Mount("/static", StaticFiles(directory=_public_dir)),
+            Route("/{path:path}", spa_fallback),
+            Route("/", spa_fallback),
         ],
     )
     app.state.manager = manager

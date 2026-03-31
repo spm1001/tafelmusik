@@ -23,14 +23,15 @@ const commentMark = Decoration.mark({class: "cm-comment-highlight"});
 const programmatic = Annotation.define();
 
 function init() {
-  const room = new URLSearchParams(window.location.search).get("room") || "default";
+  const room = window.location.pathname.replace(/^\/+/, "") || "default";
   document.getElementById("room-name").textContent = room;
 
   const ydoc = new Y.Doc();
   const ytext = ydoc.getText("content");
   const comments = ydoc.getMap("comments");
 
-  const wsUrl = `ws://${window.location.host}`;
+  const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = `${wsProto}//${window.location.host}/_ws`;
   const provider = new WebsocketProvider(wsUrl, room, ydoc);
 
   provider.on("status", ({status}) => {
@@ -410,6 +411,134 @@ function init() {
       renderComments();
     }
   });
+
+  // --- File browser ---
+
+  const filesPane = document.getElementById("files-pane");
+  const filesTree = document.getElementById("files-tree");
+  const filesToggle = document.getElementById("files-toggle");
+  const filesClose = document.getElementById("files-close");
+  const newDocInput = document.getElementById("new-doc-input");
+
+  filesToggle.addEventListener("click", () => {
+    filesPane.classList.toggle("collapsed");
+  });
+  filesClose.addEventListener("click", () => {
+    filesPane.classList.add("collapsed");
+  });
+
+  newDocInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      const path = newDocInput.value.trim().replace(/\.md$/, "");
+      if (path) {
+        addRecent(path);
+        window.location.pathname = "/" + path;
+      }
+    }
+  });
+
+  // Recently accessed — stored in localStorage
+  function getRecents() {
+    try { return JSON.parse(localStorage.getItem("tfm-recents") || "[]"); } catch { return []; }
+  }
+  function addRecent(name) {
+    let recents = getRecents().filter((r) => r !== name);
+    recents.unshift(name);
+    if (recents.length > 20) recents = recents.slice(0, 20);
+    localStorage.setItem("tfm-recents", JSON.stringify(recents));
+  }
+
+  // Record current room as recent
+  if (room !== "default") addRecent(room);
+
+  function buildTree(rooms) {
+    const tree = {};
+    for (const r of rooms) {
+      const parts = r.name.split("/");
+      let node = tree;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (!node[parts[i]]) node[parts[i]] = {};
+        node = node[parts[i]];
+      }
+      node["__file:" + parts[parts.length - 1]] = r;
+    }
+    return tree;
+  }
+
+  function renderTree(node, container, depth) {
+    const dirs = [];
+    const files = [];
+    for (const key of Object.keys(node).sort()) {
+      if (key.startsWith("__file:")) files.push({key: key.slice(7), data: node[key]});
+      else dirs.push(key);
+    }
+
+    for (const dir of dirs) {
+      const group = document.createElement("div");
+      group.className = "dir-group";
+
+      const label = document.createElement("div");
+      label.className = "dir-item";
+      label.style.paddingLeft = (0.75 + depth * 0.75) + "rem";
+      label.textContent = (group.classList.contains("collapsed") ? "\u25B6 " : "\u25BC ") + dir;
+      label.addEventListener("click", () => {
+        group.classList.toggle("collapsed");
+        label.textContent = (group.classList.contains("collapsed") ? "\u25B6 " : "\u25BC ") + dir;
+      });
+
+      group.appendChild(label);
+      renderTree(node[dir], group, depth + 1);
+      container.appendChild(group);
+    }
+
+    for (const file of files) {
+      const item = document.createElement("div");
+      item.className = "file-item";
+      if (file.data.name === room) item.classList.add("current");
+      item.style.paddingLeft = (0.75 + depth * 0.75) + "rem";
+
+      const dot = document.createElement("span");
+      dot.className = "dot " + (file.data.active ? "active" : "inactive");
+      item.appendChild(dot);
+
+      const name = document.createElement("span");
+      name.textContent = file.key;
+      item.appendChild(name);
+
+      item.addEventListener("click", () => {
+        addRecent(file.data.name);
+        window.location.pathname = "/" + file.data.name;
+      });
+
+      container.appendChild(item);
+    }
+  }
+
+  async function refreshFiles() {
+    try {
+      const res = await fetch("/api/rooms");
+      const data = await res.json();
+      const rooms = data.rooms || [];
+
+      // Sort: recents first, then alphabetical
+      const recents = getRecents();
+      rooms.sort((a, b) => {
+        const ai = recents.indexOf(a.name);
+        const bi = recents.indexOf(b.name);
+        if (ai !== -1 && bi !== -1) return ai - bi;
+        if (ai !== -1) return -1;
+        if (bi !== -1) return 1;
+        return a.name.localeCompare(b.name);
+      });
+
+      filesTree.innerHTML = "";
+      const tree = buildTree(rooms);
+      renderTree(tree, filesTree, 0);
+    } catch (e) {}
+  }
+
+  refreshFiles();
+  setInterval(refreshFiles, 10000);
 }
 
 if (document.readyState === "loading") {

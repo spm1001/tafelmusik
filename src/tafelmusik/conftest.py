@@ -86,7 +86,7 @@ async def connect_peer(port: int, room: str) -> AsyncIterator[Text]:
 
     async def _task() -> None:
         async with httpx.AsyncClient() as client:
-            async with aconnect_ws(f"http://127.0.0.1:{port}/{room}", client) as ws:
+            async with aconnect_ws(f"http://127.0.0.1:{port}/_ws/{room}", client) as ws:
                 channel = WebSocketChannel(ws)
                 await _sync_loop(doc, channel, synced, keepalive=None)
 

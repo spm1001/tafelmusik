@@ -486,7 +486,7 @@ class AppState:
             This function keeps both in the same task.
             """
             try:
-                async with aconnect_ws(f"{http_url}/{room}", self.client) as ws:
+                async with aconnect_ws(f"{http_url}/_ws/{room}", self.client) as ws:
                     channel = WebSocketChannel(ws)
                     await _sync_loop(doc, channel, synced, keepalive=self.keepalive)
             except Exception:

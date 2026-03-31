@@ -262,15 +262,19 @@ async def test_round_trip_hydrate_edit_flush_rehydrate(file_server):
 
 
 async def test_path_traversal_rejected(file_server):
-    """Room names that escape docs_dir don't hydrate from outside files."""
-    port, docs_dir, manager = file_server
-    # Create a file outside docs_dir
+    """Room names that escape docs_dir don't hydrate from outside files.
+
+    HTTP clients normalize .. segments (RFC 3986), so traversal through
+    URL paths is blocked at the transport level. This test verifies the
+    RoomManager-level defense: _safe_doc_path rejects room names that
+    would resolve outside docs_dir.
+    """
+    _, docs_dir, manager = file_server
     (docs_dir.parent / "secret.md").write_text("sensitive data")
 
-    # Connect with a traversal room name — should get empty room, not the file
-    async with connect_peer(port, "../secret") as text:
-        content = str(text)
-        assert "sensitive data" not in content
+    room = await manager.get_room("../secret")
+    text = room.doc.get("content", type=Text)
+    assert "sensitive data" not in str(text)
 
 
 async def test_file_takes_priority_over_sqlite(file_server):
