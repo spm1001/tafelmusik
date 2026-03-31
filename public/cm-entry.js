@@ -270,6 +270,7 @@ function init() {
     return true;
   }
 
+
   const composeView = new EditorView({
     extensions: [
       keymap.of([
