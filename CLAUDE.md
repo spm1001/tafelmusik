@@ -60,7 +60,8 @@ Mac setup (one-time): `git remote add hezza modha@hezza:Repos/batterie/tafelmusi
 
 - **Private APIs:** When using library internals (underscore-prefixed), add a comment block naming the private APIs, the validated version, and a runtime assertion. File a bon to own the functionality via public APIs. Don't block on it — ship first, own later.
 - **Port:** 3456 (ASGI server). MCP server discovers via `TAFELMUSIK_URL` env var.
-- **Docs directory (calute):** `create_app(docs_dir=...)` defaults to `ROOT / "docs"`, overridable via `TAFELMUSIK_DOCS_DIR` env var. Both ASGI and MCP must use the same path. Room names are file paths relative to docs_dir: room `meeting/2026-03-30` maps to `docs/meeting/2026-03-30.md`.
+- **URL routing:** URL path IS the room name. `http://hezza:3456/batterie/tafelmusik/docs/foo` opens room `batterie/tafelmusik/docs/foo`. WebSocket at `/_ws/{room:path}`, static assets at `/static/`, all other paths serve `index.html` (SPA pattern). No `?room=` query parameter.
+- **Docs directory (calute):** `create_app(docs_dir=...)` defaults to `~/Repos`, overridable via `TAFELMUSIK_DOCS_DIR` env var. Both ASGI and MCP must use the same path. Room names are file paths relative to docs_dir: room `batterie/tafelmusik/docs/foo` maps to `~/Repos/batterie/tafelmusik/docs/foo.md`. File listing skips dotdirs, node_modules, __pycache__, and other non-document directories.
 - **File hydration priority:** .md file in docs_dir → SQLite store → empty Doc. File takes priority because SQLite may hold stale CRDT state from a previous session.
 - **`flush_doc` tool:** Reads Y.Text, writes .md to docs_dir, wipes comments from Y.Map, git commits. The flush IS the compaction — sidesteps the pycrdt-store squashing bug for file-backed rooms.
 - **Path validation:** `RoomManager._safe_doc_path()` resolves room names and rejects paths escaping docs_dir. `flush_doc` has the same check. Both use `Path.resolve()` + `is_relative_to()`.
