@@ -701,21 +701,6 @@ def _get_state(ctx: Context) -> AppState:
 # --- Tools ---
 
 
-@mcp.tool()
-async def read_doc(room: str, ctx: Context) -> str:
-    """Read the full markdown content of a document.
-
-    Args:
-        room: Document room name (e.g. "meeting-notes", "draft")
-    """
-    state = _get_state(ctx)
-    conn = await state.connect(room)
-    content = document.read(conn.text)
-    if not content:
-        return f"(Document '{room}' is empty)"
-    return content
-
-
 def _reanchor_summary(result: dict) -> str:
     """Format re-anchoring results as a suffix for edit responses."""
     parts = []
