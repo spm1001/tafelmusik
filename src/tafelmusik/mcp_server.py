@@ -17,6 +17,7 @@ and _sync_loop() — separating them across tasks causes cancel scope errors.
 from __future__ import annotations
 
 import asyncio
+import json as json_mod
 import logging
 import os
 import subprocess
@@ -92,6 +93,29 @@ def _log_tool_error(op: str, room: str, t0: float) -> None:
     dur = (time.monotonic() - t0) * 1000
     log.warning("[tfm] op=%s room=%s dur=%.0fms status=error", op, room, dur,
                 exc_info=True)
+
+
+_SIGNAL_PATH = Path(os.environ.get(
+    "TAFELMUSIK_SIGNAL", str(Path.home() / ".tafelmusik-signal")
+))
+
+
+def _write_signal(room: str, event: dict, drift: int) -> None:
+    """Write comment event to signal file for FileChanged hook delivery."""
+    try:
+        entry = json_mod.dumps({
+            "room": room,
+            "author": event["author"],
+            "quote": event["quote"],
+            "body": event["body"],
+            "drift": drift,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        with _SIGNAL_PATH.open("a") as f:
+            f.write(entry + "\n")
+        log.info("[tfm] signal written to %s", _SIGNAL_PATH)
+    except Exception:
+        log.warning("[tfm] failed to write signal file", exc_info=True)
 
 
 def _ws_to_http(url: str) -> str:
@@ -376,6 +400,9 @@ async def _comment_consumer(
                     room,
                     exc_info=True,
                 )
+
+            # Signal file — FileChanged hook delivery (no channel needed)
+            _write_signal(room, event, drift)
 
         # Reset snapshot after high-drift push and cancel idle timer
         # (prevents a redundant resync if the timer fires before next edit)

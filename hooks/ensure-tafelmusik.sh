@@ -11,6 +11,9 @@ if [ -f "$PLUGIN_ROOT/instructions.md" ]; then
     ln -sf "$PLUGIN_ROOT/instructions.md" "$HOME/.claude/rules/tafelmusik.md"
 fi
 
+# 0b. Signal file for FileChanged hook
+touch "$HOME/.tafelmusik-signal"
+
 PORT="${TAFELMUSIK_PORT:-3456}"
 URL="http://127.0.0.1:${PORT}/"
 
@@ -28,7 +31,7 @@ fi
 
 # 3. Check ASGI server
 if curl -sf --max-time 2 "$URL" >/dev/null 2>&1; then
-    echo '{"hookSpecificOutput": "Tafelmusik server running on :'"$PORT"'"}'
+    echo '{"hookSpecificOutput": "Tafelmusik server running on :'"$PORT"'", "watchPaths": ["'"$HOME"'/.tafelmusik-signal"]}'
     exit 0
 fi
 
@@ -51,7 +54,7 @@ fi
 # Wait for server
 for i in 1 2 3 4 5; do
     if curl -sf --max-time 1 "$URL" >/dev/null 2>&1; then
-        echo '{"hookSpecificOutput": "Tafelmusik server started on :'"$PORT"'"}'
+        echo '{"hookSpecificOutput": "Tafelmusik server started on :'"$PORT"'", "watchPaths": ["'"$HOME"'/.tafelmusik-signal"]}'
         exit 0
     fi
     sleep 1

@@ -34,6 +34,17 @@ function init() {
   const wsUrl = `${wsProto}//${window.location.host}/_ws`;
   const provider = new WebsocketProvider(wsUrl, room, ydoc);
 
+  // y-websocket closes the connection after 30s of silence
+  // (messageReconnectTimeout, hardcoded). Our server doesn't echo awareness
+  // messages, so during quiet editing the browser sees no incoming traffic
+  // and kills the connection. Fix: reset the last-message timestamp
+  // periodically so the reconnect timer never fires.
+  setInterval(() => {
+    if (provider.wsconnected) {
+      provider.wsLastMessageReceived = Date.now();
+    }
+  }, 10000);
+
   provider.on("status", ({status}) => {
     const el = document.getElementById("connection-status");
     el.textContent = status === "connected" ? "connected" : status;
@@ -319,6 +330,10 @@ function init() {
     // Detach compose card before clearing — prevents destroying its CM6 instance
     const hadCompose = composeCard.parentNode === commentsList;
     if (hadCompose) composeCard.remove();
+
+    // Track whether compose editor has focus — we must restore it after DOM rebuild
+    const composeFocused = hadCompose && composeEditorWrap.contains(document.activeElement);
+
     commentsList.innerHTML = "";
 
     if (ranges.length === 0 && mode === "document") {
@@ -403,9 +418,10 @@ function init() {
       commentsList.appendChild(card);
     }
 
-    // Re-insert compose card if commenting
+    // Re-insert compose card if commenting, restore focus if it was focused
     if (mode === "commenting") {
       positionComposeCard();
+      if (composeFocused) composeView.focus();
     }
   }
 
