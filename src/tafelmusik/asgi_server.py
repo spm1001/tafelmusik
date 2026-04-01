@@ -131,7 +131,11 @@ class Room:
         both are established — including DB initialization completing.
         """
         async with self._store:
-            await self._store.db_initialized.wait()
+            try:
+                await asyncio.wait_for(self._store.db_initialized.wait(), timeout=5.0)
+            except TimeoutError:
+                log.warning("Room %s: db_initialized took >5s, still waiting", self.name)
+                await self._store.db_initialized.wait()
             async with self.doc.events() as events:
                 ready.set()
                 async for event in events:
@@ -156,6 +160,7 @@ class Room:
             await channel.send(message)
         except Exception:
             self.channels.discard(channel)
+            log.warning("Room %s: dropped channel on send failure", self.name)
 
     async def serve(self, channel: StarletteWebsocket) -> None:
         """Handle a single WebSocket client.
@@ -289,7 +294,8 @@ def create_app(
             with sqlite3.connect(_db_path) as conn:
                 return {row[0] for row in conn.execute("SELECT DISTINCT path FROM yupdates")}
         except Exception:
-            return set()  # DB may not exist yet
+            log.warning("Failed to query persisted rooms from %s", _db_path, exc_info=True)
+            return set()
 
     # Directories skipped when scanning docs_dir for .md files.
     # Dotdirs (.bon, .claude, .git), dependency dirs, and build artifacts

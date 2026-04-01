@@ -63,6 +63,37 @@ DRIFT_THRESHOLD = 1024
 IDLE_TIMEOUT = 30.0
 
 
+# --- Tool logging helpers ---
+# Key=value format for greppability. Room name is the correlation key
+# between MCP server (stderr) and ASGI server (journalctl) logs.
+
+
+def _log_tool_entry(op: str, room: str = "?", **extras: object) -> float:
+    """Log tool entry, return monotonic timestamp for duration."""
+    parts = [f"op={op}", f"room={room}"]
+    parts.extend(f"{k}={v}" for k, v in extras.items() if v is not None)
+    log.info("[tfm] %s", " ".join(parts))
+    return time.monotonic()
+
+
+def _log_tool_result(
+    op: str, room: str, t0: float, result: str, *, error: bool = False
+) -> None:
+    """Log tool completion. Caller specifies error status explicitly."""
+    dur = (time.monotonic() - t0) * 1000
+    level = logging.WARNING if error else logging.INFO
+    preview = result[:100].replace("\n", " ")
+    log.log(level, "[tfm] op=%s room=%s dur=%.0fms status=%s %s",
+            op, room, dur, "error" if error else "ok", preview)
+
+
+def _log_tool_error(op: str, room: str, t0: float) -> None:
+    """Log uncaught tool exception. Call from except block before re-raising."""
+    dur = (time.monotonic() - t0) * 1000
+    log.warning("[tfm] op=%s room=%s dur=%.0fms status=error", op, room, dur,
+                exc_info=True)
+
+
 def _ws_to_http(url: str) -> str:
     """Convert ws:// or wss:// URL to http:// or https:// for httpx."""
     return url.replace("ws://", "http://").replace("wss://", "https://")
@@ -463,12 +494,15 @@ class AppState:
         if room in self.rooms:
             conn = self.rooms[room]
             if not conn.dead.is_set():
+                log.debug("[tfm] op=connect room=%s cached", room)
                 return conn
             # Connection died — clean up before reconnecting
-            log.info("Room %s connection lost, reconnecting", room)
+            log.info("[tfm] op=connect room=%s reconnecting (previous died)", room)
             await conn.close()
             del self.rooms[room]
 
+        log.info("[tfm] op=connect room=%s", room)
+        t0 = time.monotonic()
         # httpx-ws uses http:// for the WebSocket upgrade
         http_url = _ws_to_http(self.server_url)
 
@@ -512,6 +546,7 @@ class AppState:
             dead_task.cancel()
 
         if not synced.is_set():
+            dt = (time.monotonic() - t0) * 1000
             # Check dead BEFORE cancelling — cancellation always sets dead
             # via the finally block, so checking after would always be True.
             failed_fast = dead.is_set()
@@ -521,14 +556,19 @@ class AppState:
             except (asyncio.CancelledError, Exception):
                 pass
             if failed_fast:
+                log.warning("[tfm] op=connect room=%s dur=%.0fms status=unreachable", room, dt)
                 raise ConnectionError(
                     f"Connection to room '{room}' failed. "
                     f"Is the Tafelmusik server running on {self.server_url}?"
                 )
+            log.warning("[tfm] op=connect room=%s dur=%.0fms status=timeout", room, dt)
             raise TimeoutError(
                 f"Sync with Tafelmusik server timed out after {self.sync_timeout}s "
                 f"for room '{room}'. Is the server running and responding?"
             )
+
+        dt = (time.monotonic() - t0) * 1000
+        log.info("[tfm] op=connect room=%s dur=%.0fms status=ok", room, dt)
 
         conn = RoomConnection(
             doc=doc,
@@ -805,94 +845,122 @@ async def edit_doc(
         find: Text to find (required for patch mode)
         replace: Replacement text (required for patch mode; empty string = delete)
     """
-    state = _get_state(ctx)
-    conn = await state.connect(room)
+    t0 = _log_tool_entry("edit_doc", room, mode=mode)
+    try:
+        state = _get_state(ctx)
+        conn = await state.connect(room)
 
-    if mode in ("append", "replace_section") and not content:
-        return f"{mode} mode requires 'content' parameter"
+        if mode in ("append", "replace_section") and not content:
+            msg = f"{mode} mode requires 'content' parameter"
+            _log_tool_result("edit_doc", room, t0, msg, error=True)
+            return msg
 
-    if mode == "append":
-        with conn.doc.transaction(origin=authors.CLAUDE):
-            conn.text.insert(len(str(conn.text)), content, attrs={"author": authors.CLAUDE})
-        return f"Appended {len(content)} chars to '{room}'"
-    elif mode == "replace_all":
-        comments_map: Map = conn.doc.get("comments", type=Map)
-        doc_len = len(str(conn.text))
-        affected = comments.collect_affected(conn.text, comments_map, 0, doc_len)
-        document.replace_all(conn.text, content, author=authors.CLAUDE)
-        result = comments.reanchor(conn.text, comments_map, affected, author=authors.CLAUDE)
-        suffix = _reanchor_summary(result)
-        return f"Replaced all content in '{room}' ({len(content)} chars){suffix}"
-    elif mode == "replace_section":
-        try:
+        if mode == "append":
+            with conn.doc.transaction(origin=authors.CLAUDE):
+                conn.text.insert(len(str(conn.text)), content, attrs={"author": authors.CLAUDE})
+            msg = f"Appended {len(content)} chars to '{room}'"
+            _log_tool_result("edit_doc", room, t0, msg)
+            return msg
+        elif mode == "replace_all":
             comments_map: Map = conn.doc.get("comments", type=Map)
-            doc_content = str(conn.text)
-            heading = content.split("\n", 1)[0].strip()
-            bounds = document.find_section(doc_content, heading)
-            if bounds:
-                sec_start, sec_end = bounds
-                affected = comments.collect_affected(conn.text, comments_map, sec_start, sec_end)
-            else:
-                affected = []  # new section — nothing to re-anchor
-            replaced = document.replace_section(conn.text, content, author=authors.CLAUDE)
-            if affected:
-                # Search within the new section's bounds
-                new_bounds = document.find_section(str(conn.text), heading)
-                if new_bounds:
+            doc_len = len(str(conn.text))
+            affected = comments.collect_affected(conn.text, comments_map, 0, doc_len)
+            document.replace_all(conn.text, content, author=authors.CLAUDE)
+            result = comments.reanchor(conn.text, comments_map, affected, author=authors.CLAUDE)
+            suffix = _reanchor_summary(result)
+            msg = f"Replaced all content in '{room}' ({len(content)} chars){suffix}"
+            _log_tool_result("edit_doc", room, t0, msg)
+            return msg
+        elif mode == "replace_section":
+            try:
+                comments_map: Map = conn.doc.get("comments", type=Map)
+                doc_content = str(conn.text)
+                heading = content.split("\n", 1)[0].strip()
+                bounds = document.find_section(doc_content, heading)
+                if bounds:
+                    sec_start, sec_end = bounds
+                    affected = comments.collect_affected(
+                        conn.text, comments_map, sec_start, sec_end
+                    )
+                else:
+                    affected = []  # new section — nothing to re-anchor
+                replaced = document.replace_section(conn.text, content, author=authors.CLAUDE)
+                if affected:
+                    # Search within the new section's bounds
+                    new_bounds = document.find_section(str(conn.text), heading)
+                    if new_bounds:
+                        result = comments.reanchor(
+                            conn.text,
+                            comments_map,
+                            affected,
+                            search_start=new_bounds[0],
+                            search_end=new_bounds[1],
+                            author=authors.CLAUDE,
+                        )
+                    else:
+                        result = comments.reanchor(
+                            conn.text, comments_map, affected, author=authors.CLAUDE
+                        )
+                else:
+                    result = {"reanchored": [], "orphaned": []}
+            except ValueError as e:
+                msg = str(e)
+                _log_tool_result("edit_doc", room, t0, msg, error=True)
+                return msg
+            verb = "Replaced existing" if replaced else "Appended new"
+            suffix = _reanchor_summary(result)
+            msg = f"{verb} section '{heading}' in '{room}'{suffix}"
+            _log_tool_result("edit_doc", room, t0, msg)
+            return msg
+        elif mode == "patch":
+            if not find:
+                msg = "patch mode requires 'find' parameter"
+                _log_tool_result("edit_doc", room, t0, msg, error=True)
+                return msg
+            try:
+                comments_map: Map = conn.doc.get("comments", type=Map)
+                doc_content = str(conn.text)
+                patch_start = doc_content.find(find)
+                if patch_start != -1:
+                    patch_end = patch_start + len(find)
+                    affected = comments.collect_affected(
+                        conn.text, comments_map, patch_start, patch_end
+                    )
+                else:
+                    affected = []
+                document.patch(conn.text, find, replace, author=authors.CLAUDE)
+                if affected:
+                    # Search region: where the patch landed + replacement length
+                    search_end = patch_start + len(replace) if replace else patch_start
                     result = comments.reanchor(
                         conn.text,
                         comments_map,
                         affected,
-                        search_start=new_bounds[0],
-                        search_end=new_bounds[1],
+                        search_start=patch_start,
+                        search_end=max(search_end, patch_start + 1),
                         author=authors.CLAUDE,
                     )
                 else:
-                    result = comments.reanchor(
-                        conn.text, comments_map, affected, author=authors.CLAUDE
-                    )
-            else:
-                result = {"reanchored": [], "orphaned": []}
-        except ValueError as e:
-            return str(e)
-        verb = "Replaced existing" if replaced else "Appended new"
-        suffix = _reanchor_summary(result)
-        return f"{verb} section '{heading}' in '{room}'{suffix}"
-    elif mode == "patch":
-        if not find:
-            return "patch mode requires 'find' parameter"
-        try:
-            comments_map: Map = conn.doc.get("comments", type=Map)
-            doc_content = str(conn.text)
-            patch_start = doc_content.find(find)
-            if patch_start != -1:
-                patch_end = patch_start + len(find)
-                affected = comments.collect_affected(
-                    conn.text, comments_map, patch_start, patch_end
-                )
-            else:
-                affected = []
-            document.patch(conn.text, find, replace, author=authors.CLAUDE)
-            if affected:
-                # Search region: where the patch landed + replacement length
-                search_end = patch_start + len(replace) if replace else patch_start
-                result = comments.reanchor(
-                    conn.text,
-                    comments_map,
-                    affected,
-                    search_start=patch_start,
-                    search_end=max(search_end, patch_start + 1),
-                    author=authors.CLAUDE,
-                )
-            else:
-                result = {"reanchored": [], "orphaned": []}
-        except ValueError as e:
-            return f"Patch failed: {e}"
-        action = "Deleted" if not replace else "Patched"
-        suffix = _reanchor_summary(result)
-        return f"{action} {len(find)} chars in '{room}'{suffix}"
-    else:
-        return f"Unknown mode '{mode}'. Use 'append', 'replace_all', 'replace_section', or 'patch'."
+                    result = {"reanchored": [], "orphaned": []}
+            except ValueError as e:
+                msg = f"Patch failed: {e}"
+                _log_tool_result("edit_doc", room, t0, msg, error=True)
+                return msg
+            action = "Deleted" if not replace else "Patched"
+            suffix = _reanchor_summary(result)
+            msg = f"{action} {len(find)} chars in '{room}'{suffix}"
+            _log_tool_result("edit_doc", room, t0, msg)
+            return msg
+        else:
+            msg = (
+                f"Unknown mode '{mode}'. "
+                "Use 'append', 'replace_all', 'replace_section', or 'patch'."
+            )
+            _log_tool_result("edit_doc", room, t0, msg, error=True)
+            return msg
+    except Exception:
+        _log_tool_error("edit_doc", room, t0)
+        raise
 
 
 @mcp.tool()
@@ -906,15 +974,22 @@ async def load_doc(room: str, markdown: str, ctx: Context) -> str:
         room: Document room name
         markdown: The full markdown content to load
     """
-    state = _get_state(ctx)
-    conn = await state.connect(room)
-    comments_map: Map = conn.doc.get("comments", type=Map)
-    doc_len = len(str(conn.text))
-    affected = comments.collect_affected(conn.text, comments_map, 0, doc_len)
-    document.replace_all(conn.text, markdown, author=authors.CLAUDE)
-    result = comments.reanchor(conn.text, comments_map, affected, author=authors.CLAUDE)
-    suffix = _reanchor_summary(result)
-    return f"Loaded {len(markdown)} chars into '{room}'{suffix}"
+    t0 = _log_tool_entry("load_doc", room, chars=len(markdown))
+    try:
+        state = _get_state(ctx)
+        conn = await state.connect(room)
+        comments_map: Map = conn.doc.get("comments", type=Map)
+        doc_len = len(str(conn.text))
+        affected = comments.collect_affected(conn.text, comments_map, 0, doc_len)
+        document.replace_all(conn.text, markdown, author=authors.CLAUDE)
+        result = comments.reanchor(conn.text, comments_map, affected, author=authors.CLAUDE)
+        suffix = _reanchor_summary(result)
+        msg = f"Loaded {len(markdown)} chars into '{room}'{suffix}"
+        _log_tool_result("load_doc", room, t0, msg)
+        return msg
+    except Exception:
+        _log_tool_error("load_doc", room, t0)
+        raise
 
 
 @mcp.tool()
@@ -923,6 +998,7 @@ async def list_docs(ctx: Context) -> str:
 
     Returns room names from both active connections and persisted storage.
     """
+    t0 = _log_tool_entry("list_docs")
     state = _get_state(ctx)
     http_url = _ws_to_http(state.server_url)
     try:
@@ -931,7 +1007,9 @@ async def list_docs(ctx: Context) -> str:
         data = response.json()
         rooms = data.get("rooms", [])
         if not rooms:
-            return "No documents found."
+            msg = "No documents found."
+            _log_tool_result("list_docs", "?", t0, msg)
+            return msg
         lines = []
         for entry in rooms:
             if isinstance(entry, str):
@@ -940,9 +1018,13 @@ async def list_docs(ctx: Context) -> str:
                 name = entry["name"]
                 marker = " (active)" if entry.get("active") else ""
                 lines.append(f"  - {name}{marker}")
-        return "Documents:\n" + "\n".join(lines)
+        msg = "Documents:\n" + "\n".join(lines)
+        _log_tool_result("list_docs", "?", t0, msg)
+        return msg
     except httpx.HTTPError:
-        return "Could not list documents (is the Tafelmusik server running?)"
+        msg = "Could not list documents (is the Tafelmusik server running?)"
+        _log_tool_result("list_docs", "?", t0, msg, error=True)
+        return msg
 
 
 @mcp.tool()
@@ -956,47 +1038,62 @@ async def flush_doc(room: str, ctx: Context) -> str:
     Args:
         room: Document room name (maps to file path relative to docs_dir)
     """
-    state = _get_state(ctx)
-    conn = await state.connect(room)
+    t0 = _log_tool_entry("flush_doc", room)
+    try:
+        state = _get_state(ctx)
+        conn = await state.connect(room)
 
-    content = str(conn.text)
-    docs_dir = _get_docs_dir(state)
-    md_path = (docs_dir / f"{room}.md").resolve()
-    if not md_path.is_relative_to(docs_dir.resolve()):
-        return f"Room name '{room}' escapes docs directory — rejected."
-    md_path.parent.mkdir(parents=True, exist_ok=True)
-    md_path.write_text(content)
+        content = str(conn.text)
+        docs_dir = _get_docs_dir(state)
+        md_path = (docs_dir / f"{room}.md").resolve()
+        if not md_path.is_relative_to(docs_dir.resolve()):
+            msg = f"Room name '{room}' escapes docs directory — rejected."
+            _log_tool_result("flush_doc", room, t0, msg, error=True)
+            return msg
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        md_path.write_text(content)
 
-    # Wipe comments
-    comments_map: Map = conn.doc.get("comments", type=Map)
-    wiped = comments.clear_all(conn.doc, comments_map, author=authors.CLAUDE)
+        # Wipe comments
+        comments_map: Map = conn.doc.get("comments", type=Map)
+        wiped = comments.clear_all(conn.doc, comments_map, author=authors.CLAUDE)
 
-    # Git commit the file (only if docs_dir is inside a git repo)
-    git_status = ""
-    repo_root = _find_git_root(docs_dir)
-    if repo_root:
-        git_msg = f"flush: {room}"
-        try:
-            subprocess.run(
-                ["git", "add", str(md_path)],
-                cwd=str(repo_root),
-                check=True,
-                capture_output=True,
-            )
-            subprocess.run(
-                ["git", "commit", "-m", git_msg, "--", str(md_path)],
-                cwd=str(repo_root),
-                check=True,
-                capture_output=True,
-            )
-            git_status = " Git committed."
-        except subprocess.CalledProcessError:
-            git_status = " Git commit skipped (no changes)."
-    else:
-        git_status = " No git repo found — skipped commit."
+        # Git commit the file (only if docs_dir is inside a git repo)
+        git_status = ""
+        repo_root = _find_git_root(docs_dir)
+        if repo_root:
+            git_msg = f"flush: {room}"
+            try:
+                subprocess.run(
+                    ["git", "add", str(md_path)],
+                    cwd=str(repo_root),
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", git_msg, "--", str(md_path)],
+                    cwd=str(repo_root),
+                    check=True,
+                    capture_output=True,
+                )
+                git_status = " Git committed."
+            except subprocess.CalledProcessError as e:
+                if e.returncode == 1:
+                    # git commit returns 1 for "nothing to commit" — expected
+                    git_status = " Git commit skipped (no changes)."
+                else:
+                    stderr_msg = e.stderr.decode().strip() if e.stderr else f"exit {e.returncode}"
+                    log.warning("[tfm] op=flush_doc room=%s git_error: %s", room, stderr_msg)
+                    git_status = f" Git commit failed (exit {e.returncode})."
+        else:
+            git_status = " No git repo found — skipped commit."
 
-    comment_note = f" {wiped} comment(s) cleared." if wiped else ""
-    return f"Flushed {len(content)} chars to {md_path}.{comment_note}{git_status}"
+        comment_note = f" {wiped} comment(s) cleared." if wiped else ""
+        msg = f"Flushed {len(content)} chars to {md_path}.{comment_note}{git_status}"
+        _log_tool_result("flush_doc", room, t0, msg)
+        return msg
+    except Exception:
+        _log_tool_error("flush_doc", room, t0)
+        raise
 
 
 @mcp.tool()
@@ -1014,24 +1111,36 @@ async def inspect_doc(room: str, ctx: Context) -> str:
     Args:
         room: Document room name
     """
-    state = _get_state(ctx)
-    conn = await state.connect(room)
+    t0 = _log_tool_entry("inspect_doc", room)
+    try:
+        state = _get_state(ctx)
+        conn = await state.connect(room)
 
-    drift = _compute_drift(conn, room)
-    drift_status = "stale" if drift > DRIFT_THRESHOLD else "fresh"
-    header = f"Document '{room}' — drift: {drift}B ({drift_status}, threshold: {DRIFT_THRESHOLD}B)"
+        drift = _compute_drift(conn, room)
+        drift_status = "stale" if drift > DRIFT_THRESHOLD else "fresh"
+        header = (
+            f"Document '{room}' — drift: {drift}B"
+            f" ({drift_status}, threshold: {DRIFT_THRESHOLD}B)"
+        )
 
-    chunks = conn.text.diff()
-    if not chunks:
-        return f"{header}\n(empty)"
-    lines = []
-    for content, attrs in chunks:
-        preview = repr(content) if len(content) <= 80 else repr(content[:77] + "...")
-        if attrs:
-            lines.append(f"  {preview}  attrs={attrs}")
-        else:
-            lines.append(f"  {preview}")
-    return f"{header}\n{len(chunks)} chunk(s):\n" + "\n".join(lines)
+        chunks = conn.text.diff()
+        if not chunks:
+            msg = f"{header}\n(empty)"
+            _log_tool_result("inspect_doc", room, t0, msg)
+            return msg
+        lines = []
+        for content, attrs in chunks:
+            preview = repr(content) if len(content) <= 80 else repr(content[:77] + "...")
+            if attrs:
+                lines.append(f"  {preview}  attrs={attrs}")
+            else:
+                lines.append(f"  {preview}")
+        msg = f"{header}\n{len(chunks)} chunk(s):\n" + "\n".join(lines)
+        _log_tool_result("inspect_doc", room, t0, msg)
+        return msg
+    except Exception:
+        _log_tool_error("inspect_doc", room, t0)
+        raise
 
 
 @mcp.tool()
@@ -1047,16 +1156,25 @@ async def add_comment(room: str, quote: str, body: str, ctx: Context) -> str:
         quote: Exact text to comment on (must exist in the document)
         body: The comment text
     """
-    state = _get_state(ctx)
-    conn = await state.connect(room)
-    comments_map: Map = conn.doc.get("comments", type=Map)
+    t0 = _log_tool_entry("add_comment", room)
     try:
-        comments.add_comment(
-            conn.doc, conn.text, comments_map, quote, body, author=authors.CLAUDE
-        )
-    except ValueError as e:
-        return str(e)
-    return f"Comment added on '{room}': {body!r} anchored to {quote!r}"
+        state = _get_state(ctx)
+        conn = await state.connect(room)
+        comments_map: Map = conn.doc.get("comments", type=Map)
+        try:
+            comments.add_comment(
+                conn.doc, conn.text, comments_map, quote, body, author=authors.CLAUDE
+            )
+        except ValueError as e:
+            msg = str(e)
+            _log_tool_result("add_comment", room, t0, msg, error=True)
+            return msg
+        msg = f"Comment added on '{room}': {body!r} anchored to {quote!r}"
+        _log_tool_result("add_comment", room, t0, msg)
+        return msg
+    except Exception:
+        _log_tool_error("add_comment", room, t0)
+        raise
 
 
 @mcp.tool()
@@ -1069,28 +1187,37 @@ async def list_comments(room: str, ctx: Context) -> str:
     Args:
         room: Document room name
     """
-    state = _get_state(ctx)
-    conn = await state.connect(room)
-    comments_map: Map = conn.doc.get("comments", type=Map)
-    entries = comments.list_comments(comments_map)
+    t0 = _log_tool_entry("list_comments", room)
+    try:
+        state = _get_state(ctx)
+        conn = await state.connect(room)
+        comments_map: Map = conn.doc.get("comments", type=Map)
+        entries = comments.list_comments(comments_map)
 
-    if not entries:
-        return f"No comments on '{room}'"
+        if not entries:
+            msg = f"No comments on '{room}'"
+            _log_tool_result("list_comments", room, t0, msg)
+            return msg
 
-    lines = [f"Comments on '{room}' — {len(entries)} comment(s):\n"]
-    for e in entries:
-        flags = []
-        if e["resolved"]:
-            flags.append("resolved")
-        if e["orphaned"]:
-            flags.append("orphaned")
-        status = f" [{', '.join(flags)}]" if flags else ""
-        lines.append(f"  {e['author']}{status}")
-        lines.append(f"  > {e['quote']}")
-        lines.append(f"  {e['body']}")
-        lines.append("")
+        lines = [f"Comments on '{room}' — {len(entries)} comment(s):\n"]
+        for e in entries:
+            flags = []
+            if e["resolved"]:
+                flags.append("resolved")
+            if e["orphaned"]:
+                flags.append("orphaned")
+            status = f" [{', '.join(flags)}]" if flags else ""
+            lines.append(f"  {e['author']}{status}")
+            lines.append(f"  > {e['quote']}")
+            lines.append(f"  {e['body']}")
+            lines.append("")
 
-    return "\n".join(lines)
+        msg = "\n".join(lines)
+        _log_tool_result("list_comments", room, t0, msg)
+        return msg
+    except Exception:
+        _log_tool_error("list_comments", room, t0)
+        raise
 
 
 @mcp.tool()
@@ -1104,15 +1231,24 @@ async def resolve_comment(room: str, quote: str, ctx: Context) -> str:
         room: Document room name
         quote: The quoted text of the comment to resolve (from list_comments)
     """
-    state = _get_state(ctx)
-    conn = await state.connect(room)
-    comments_map: Map = conn.doc.get("comments", type=Map)
-    resolved_count = comments.resolve_comment(
-        conn.doc, comments_map, quote, author=authors.CLAUDE
-    )
-    if resolved_count == 0:
-        return f"No active comment found with quote: {quote!r}"
-    return f"Resolved {resolved_count} comment(s) on '{room}' matching {quote!r}"
+    t0 = _log_tool_entry("resolve_comment", room)
+    try:
+        state = _get_state(ctx)
+        conn = await state.connect(room)
+        comments_map: Map = conn.doc.get("comments", type=Map)
+        resolved_count = comments.resolve_comment(
+            conn.doc, comments_map, quote, author=authors.CLAUDE
+        )
+        if resolved_count == 0:
+            msg = f"No active comment found with quote: {quote!r}"
+            _log_tool_result("resolve_comment", room, t0, msg)
+            return msg
+        msg = f"Resolved {resolved_count} comment(s) on '{room}' matching {quote!r}"
+        _log_tool_result("resolve_comment", room, t0, msg)
+        return msg
+    except Exception:
+        _log_tool_error("resolve_comment", room, t0)
+        raise
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ function init() {
     el.textContent = status === "connected" ? "connected" : status;
     el.className = "status " + status;
     if (status !== "connected") {
-      console.warn("[tfm] connection status:", status, new Error().stack);
+      console.warn(`[tfm] room=${room} connection status:`, status, new Error().stack);
     }
   });
 
@@ -134,7 +134,9 @@ function init() {
         if (from >= 0 && to > from && to <= docText.length) {
           ranges.push({from, to, id, quote, body: comment.get("body"), author: comment.get("author"), created: comment.get("created") || ""});
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error(`[tfm] resolveRanges: comment ${id} failed:`, e);
+      }
     });
 
     // Comments with overlapping ranges are "same conversation" → sort by creation time.
@@ -209,7 +211,7 @@ function init() {
         const wasCommenting = mode === "commenting";
         renderComments();
         if (wasCommenting) composeView.focus();
-        try { v.dispatch({}); } catch (e) {}
+        try { v.dispatch({}); } catch (e) { console.error("[tfm] dispatch after comment update failed:", e); }
       });
     };
     comments.observeDeep(observer);
@@ -617,7 +619,9 @@ function init() {
       const data = await res.json();
       allRooms = data.rooms || [];
       renderFileList();
-    } catch (e) {}
+    } catch (e) {
+      console.error("[tfm] refreshFiles failed:", e);
+    }
   }
 
   refreshFiles();

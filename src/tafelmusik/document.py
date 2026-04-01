@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import re
 
 from pycrdt import Text
+
+log = logging.getLogger(__name__)
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 _FENCE_RE = re.compile(r"^(`{3,}|~{3,})", re.MULTILINE)
@@ -148,9 +151,11 @@ def patch(text: Text, find: str, replace: str, *, author: str) -> None:
     content = str(text)
     first = content.find(find)
     if first == -1:
+        log.debug("[tfm] patch: no match (find_len=%d first_chars=%r)", len(find), find[:50])
         raise ValueError(f"patch: text not found: {find!r}")
     second = content.find(find, first + 1)
     if second != -1:
+        log.debug("[tfm] patch: ambiguous (find_len=%d pos1=%d pos2=%d)", len(find), first, second)
         raise ValueError(
             f"patch: ambiguous match — found {find!r} at positions {first} and {second}"
         )
