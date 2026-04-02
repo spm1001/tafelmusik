@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -306,14 +307,27 @@ def create_app(
         ".hypothesis", "htmlcov", "site-packages",
     })
 
+    # [timestamp, results] — mutable list avoids nonlocal for nested function
+    _scan_cache = [0.0, set()]
+    _SCAN_TTL = 30.0  # seconds
+
     def _scan_doc_files() -> set[str]:
         """Scan docs_dir for authored .md files, returning room names.
 
         Skips dotdirs (e.g. .git, .bon, .claude), dependency dirs, and
         build artifacts. These contain markdown but aren't documents
         you'd want to edit collaboratively.
+
+        Results are cached for _SCAN_TTL seconds to avoid blocking the
+        event loop with rglob on every /api/rooms request.
         """
+        now = time.monotonic()
+        if now - _scan_cache[0] < _SCAN_TTL:
+            return _scan_cache[1]
+
         if not _docs_dir.exists():
+            _scan_cache[0] = now
+            _scan_cache[1] = set()
             return set()
         results = set()
         for md in _docs_dir.rglob("*.md"):
@@ -322,6 +336,8 @@ def create_app(
             if any(p.startswith(".") or p in _SKIP_DIRS for p in rel.parts[:-1]):
                 continue
             results.add(str(rel.with_suffix("")))
+        _scan_cache[0] = now
+        _scan_cache[1] = results
         return results
 
     async def list_rooms(request):
