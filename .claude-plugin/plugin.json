@@ -1,6 +1,6 @@
 {
   "name": "tafelmusik",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Collaborative editing layer for Claude and Sameer — Yjs Y.Text + CodeMirror 6 + pycrdt",
   "author": {
     "name": "Sameer Modha",
@@ -14,7 +14,7 @@
       "command": "uv",
       "args": ["run", "--directory", "${CLAUDE_PLUGIN_ROOT}", "python", "-m", "tafelmusik.mcp_server"],
       "env": {
-        "TAFELMUSIK_URL": "ws://127.0.0.1:3456"
+        "TAFELMUSIK_URL": "ws://hezza:3456"
       }
     }
   },
