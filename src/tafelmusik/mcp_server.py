@@ -108,7 +108,7 @@ def _write_signal(room: str, event: dict, drift: int) -> None:
             "author": event["author"],
             "quote": event["quote"],
             "body": event["body"],
-            "drift": drift,
+            "drift": str(drift),
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         })
         with _SIGNAL_PATH.open("a") as f:
@@ -391,7 +391,7 @@ async def _comment_consumer(
                         "room": room,
                         "type": ntype,
                         "comment_id": event["comment_id"],
-                        "drift": drift,
+                        "drift": str(drift),
                     },
                 )
             except Exception:
