@@ -1,6 +1,6 @@
 ---
 name: collaborate
-description: Orchestrates collaborative document editing. MANDATORY gate BEFORE any mcp__tafelmusik__ tool call. Invoke FIRST when user says 'edit the doc', 'check the document', 'add a comment', 'write together', or 'collaborate on this' — teaches load-first workflow, edit mode selection, and comment conventions that prevent data loss.
+description: Orchestrates collaborative document editing. Load before any mcp__tafelmusik__ tool call. Invoke first when user says 'edit the doc', 'check the document', 'add a comment', 'write together', or 'collaborate on this' — teaches load-first workflow, edit mode selection, and comment conventions that prevent data loss.
 ---
 
 # Collaborate
