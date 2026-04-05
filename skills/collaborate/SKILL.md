@@ -65,10 +65,10 @@ The `quote` must be an exact substring of the document. Sameer sees the comment 
 ### 5. Persist
 
 ```
-flush_doc(room) → writes Y.Text to .md file, wipes comments, git commits
+flush_doc(room) → writes Y.Text to .md file, git commits
 ```
 
-Flush is the "save" — it creates the durable .md file on disk. Comments are ephemeral session annotations and are cleared on flush. Only flush when the document is in a good state.
+Flush is the "save" — it creates the durable .md file on disk. Comments (stored in SQLite) survive flush — they're persistent, not ephemeral. Flush when the document text is in a good state; comments carry on.
 
 ## When to Use
 
@@ -90,4 +90,4 @@ Flush is the "save" — it creates the durable .md file on disk. Comments are ep
 | `replace_section` on `# Title` | Destroys everything below h1 | Use `replace_all` |
 | `replace_all` for a typo fix | Stomps Sameer's concurrent edits | Use `patch` |
 | Guessing document content | Stale edits, broken patches | `inspect_doc` first |
-| Flushing mid-conversation | Wipes comments Sameer hasn't seen | Flush at natural endpoints |
+| Flushing mid-conversation | Commits half-written text to disk | Flush at natural endpoints |
