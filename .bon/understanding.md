@@ -24,6 +24,10 @@ Deep Research found that CM6's OT collab doesn't guarantee position convergence 
 
 `anchored.py` (200 lines, 28 tests) — the standalone comment system with content-addressed anchoring. `playground.py` — interactive CLI for playing with comments on real files. tmux integration (Ctrl-b C popup for quick reactions anchored to selected text). This eliminated the manual serialisation loop (copy from TUI → paste in editor → structure → paste back).
 
+### Migration status (tfm-mezaza, complete)
+
+MCP comment tools (`add_comment`, `list_comments`, `resolve_comment`) now use HTTP endpoints on the ASGI server instead of Y.Map operations. Comments live in SQLite, anchored via TextQuoteSelector. Re-anchoring is lazy — computed on read, not maintained on write. `edit_doc` and `load_doc` no longer call `collect_affected`/`reanchor`. The Y.Map observer still runs for browser comments (until tfm-kozada). `flush_doc` still clears Y.Map but does not touch SQLite — this is a transitional asymmetry that resolves when the browser moves off Y.Map.
+
 ## The files-on-disk pivot (calute)
 
 The .md file is truth, the CRDT is the collaboration overlay. `docs_dir` parameter on ASGI server (default `~/Repos`). Room names = relative file paths. Hydrate CRDT from file on room open, fall back to SQLite for migration. `flush_doc` writes Y.Text to .md, git commits.
@@ -51,6 +55,7 @@ CC session ID available at `~/.claude/sessions/{PID}.json` (sessionId UUID, cwd,
 
 ## Working patterns
 
+- **Well-drawn bons replace plan files:** When bons have clear `--what` with numbered steps, `--how` with approach constraints, and `--done` with verifiable criteria, busking (no plan file, no plan mode) works. The test: after creating a bon, could you delete the plan file with no information loss? If yes, the information is in the right place.
 - **Bisect async layers:** Test each pair of libraries in isolation before reasoning about the whole stack.
 - **Review while context is hot:** Ask "what did we miss" immediately after implementing, before committing.
 - **Niche libraries:** Read source to understand the protocol, then implement yourself using public APIs.

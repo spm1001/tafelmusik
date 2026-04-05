@@ -1158,7 +1158,13 @@ async def test_room_poller_ignores_already_connected(server):
 
 
 async def test_reanchor_comment_survives_replace_section(server):
-    """Integration: browser comment re-anchors after MCP replace_section over the wire."""
+    """Y.Map reanchor: browser comment re-anchors after replace_section via StickyIndex.
+
+    Tests comments.collect_affected/reanchor (Y.Map path), NOT the MCP edit_doc tool.
+    MCP tools no longer call these functions — they rely on lazy TextQuoteSelector
+    re-anchoring via the ASGI GET endpoint. This test validates the Y.Map functions
+    themselves, which the browser still uses until tfm-kozada.
+    """
     import json
 
     from pycrdt import Assoc, Map, StickyIndex
@@ -1233,7 +1239,11 @@ async def test_reanchor_comment_survives_replace_section(server):
 
 
 async def test_reanchor_comment_orphaned_over_wire(server):
-    """Integration: browser comment is orphaned when quote is deleted via MCP."""
+    """Y.Map reanchor: browser comment orphaned when quote deleted via StickyIndex path.
+
+    Tests comments.collect_affected/reanchor (Y.Map path), NOT the MCP edit_doc tool.
+    See test_reanchor_comment_survives_replace_section for context.
+    """
     import json
 
     from pycrdt import Assoc, Map, StickyIndex
@@ -1307,3 +1317,208 @@ def test_heading_level_detection():
     assert heading_level("### Subsection") == 3
     assert heading_level("Not a heading") is None
     assert heading_level("") is None
+
+
+# --- MCP comment tools via HTTP (tfm-mezaza) ---
+
+
+async def test_add_comment_via_http(server):
+    """add_comment creates a comment in SQLite via ASGI HTTP endpoint."""
+    async with make_state(server) as state:
+        # Write content first so the quote can be found
+        conn = await state.connect("http-add-test")
+        conn.text += "The quick brown fox jumps over the lazy dog."
+        await asyncio.sleep(0.5)
+
+        # Add comment via HTTP (same path the MCP tool now uses)
+        http_url = f"http://127.0.0.1:{server}"
+        response = await state.client.post(
+            f"{http_url}/api/rooms/http-add-test/comments",
+            json={"author": authors.CLAUDE, "body": "Nice fox", "quote": "brown fox"},
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["author"] == authors.CLAUDE
+        assert data["body"] == "Nice fox"
+        assert data["quote"] == "brown fox"
+        assert data["target"] == "http-add-test"
+
+        # Verify it's listed
+        response = await state.client.get(
+            f"{http_url}/api/rooms/http-add-test/comments",
+        )
+        assert response.status_code == 200
+        entries = response.json()
+        assert len(entries) == 1
+        assert entries[0]["body"] == "Nice fox"
+
+
+async def test_list_comments_via_http(server):
+    """list_comments retrieves from SQLite via ASGI HTTP endpoint."""
+    http_url = f"http://127.0.0.1:{server}"
+
+    async with make_state(server) as state:
+        # Create two comments directly
+        for i, body in enumerate(["First", "Second"]):
+            await state.client.post(
+                f"{http_url}/api/rooms/http-list-test/comments",
+                json={"author": "sameer", "body": body},
+            )
+
+        response = await state.client.get(
+            f"{http_url}/api/rooms/http-list-test/comments",
+        )
+        assert response.status_code == 200
+        entries = response.json()
+        assert len(entries) == 2
+        assert entries[0]["body"] == "First"
+        assert entries[1]["body"] == "Second"
+
+
+async def test_resolve_comment_via_http(server):
+    """resolve_comment resolves by quote match via list-then-resolve HTTP flow."""
+    http_url = f"http://127.0.0.1:{server}"
+
+    async with make_state(server) as state:
+        # Write content and create a comment with a quote
+        conn = await state.connect("http-resolve-test")
+        conn.text += "Hello world"
+        await asyncio.sleep(0.5)
+
+        r = await state.client.post(
+            f"{http_url}/api/rooms/http-resolve-test/comments",
+            json={"author": "sameer", "body": "Fix this", "quote": "Hello"},
+        )
+        assert r.status_code == 201
+        comment_id = r.json()["id"]
+
+        # List, find by quote, resolve
+        r = await state.client.get(
+            f"{http_url}/api/rooms/http-resolve-test/comments",
+        )
+        entries = r.json()
+        matching = [
+            e for e in entries
+            if not e.get("resolved") and e.get("quote", "").strip() == "Hello"
+        ]
+        assert len(matching) == 1
+        assert matching[0]["id"] == comment_id
+
+        # Resolve
+        r = await state.client.post(
+            f"{http_url}/api/rooms/http-resolve-test/comments/{comment_id}/resolve",
+        )
+        assert r.status_code == 200
+        assert r.json()["resolved"] is True
+
+        # Default list should now be empty
+        r = await state.client.get(
+            f"{http_url}/api/rooms/http-resolve-test/comments",
+        )
+        assert len(r.json()) == 0
+
+
+async def test_add_comment_broadcasts_to_mcp_peer(server):
+    """HTTP comment creation broadcasts 0x01 to MCP's WebSocket, triggering notification."""
+    mock_session = MockSession()
+
+    async with make_state(server) as state:
+        state.session = mock_session
+        conn = await state.connect("http-broadcast-test")
+        conn.text += "The quick brown fox"
+        await asyncio.sleep(0.5)
+
+        # Create comment via HTTP (simulates Claude or tmux)
+        http_url = f"http://127.0.0.1:{server}"
+        r = await state.client.post(
+            f"{http_url}/api/rooms/http-broadcast-test/comments",
+            json={"author": "sameer", "body": "Change to red", "quote": "brown fox"},
+        )
+        assert r.status_code == 201
+
+        # Wait for 0x01 broadcast → _handle_comment_event → consumer → notification
+        await asyncio.sleep(2.0)
+
+        assert len(mock_session.messages) > 0
+        notification = mock_session.messages[0].message.root
+        assert notification.method == "notifications/claude/channel"
+        assert "sameer" in notification.params["content"]
+        assert "brown fox" in notification.params["content"]
+        assert "Change to red" in notification.params["content"]
+
+
+async def test_comment_reanchors_after_edit(server):
+    """Comment anchor position updates after Claude edits text (lazy re-anchoring).
+
+    The ASGI GET endpoint re-anchors comments from quote text on every read.
+    After text is inserted before the comment, the anchor position should shift.
+    """
+    from tafelmusik import document
+
+    async with make_state(server) as state:
+        conn = await state.connect("reanchor-lazy-test")
+        conn.text += "# Doc\n\n## Intro\n\nBrief.\n\n## API\n\nThe API uses REST.\n\n## End\n"
+        await asyncio.sleep(0.5)
+
+        http_url = f"http://127.0.0.1:{server}"
+
+        # Create comment anchored to "The API uses REST"
+        r = await state.client.post(
+            f"{http_url}/api/rooms/reanchor-lazy-test/comments",
+            json={
+                "author": "sameer",
+                "body": "Consider GraphQL",
+                "quote": "The API uses REST",
+            },
+        )
+        assert r.status_code == 201
+
+        # Verify initial anchor position
+        r = await state.client.get(f"{http_url}/api/rooms/reanchor-lazy-test/comments")
+        before = r.json()
+        assert len(before) == 1
+        assert before[0]["anchor"] is not None
+        original_start = before[0]["anchor"]["start"]
+
+        # Replace the Intro section with much more text — pushes API section down
+        document.replace_section(
+            conn.text,
+            "## Intro\n\nA long preamble that pushes everything down.\n\n"
+            "More preamble text here.\n\nEven more context.\n",
+            author=authors.CLAUDE,
+        )
+        await asyncio.sleep(0.5)
+
+        # List comments again — anchor should have shifted
+        r = await state.client.get(f"{http_url}/api/rooms/reanchor-lazy-test/comments")
+        after = r.json()
+        assert len(after) == 1
+        assert after[0]["anchor"] is not None
+        assert after[0]["anchor"]["start"] > original_start, (
+            f"Expected anchor to shift: was {original_start}, now {after[0]['anchor']['start']}"
+        )
+        assert after[0]["anchor"]["confident"] is True
+
+
+async def test_add_comment_by_claude_no_self_notification(server):
+    """Claude's own HTTP comments are filtered — no self-notification."""
+    mock_session = MockSession()
+
+    async with make_state(server) as state:
+        state.session = mock_session
+        conn = await state.connect("claude-self-test")
+        conn.text += "Hello world"
+        await asyncio.sleep(0.5)
+
+        http_url = f"http://127.0.0.1:{server}"
+        r = await state.client.post(
+            f"{http_url}/api/rooms/claude-self-test/comments",
+            json={"author": authors.CLAUDE, "body": "My own comment", "quote": "Hello"},
+        )
+        assert r.status_code == 201
+
+        # Wait for any potential notification
+        await asyncio.sleep(2.0)
+
+        # No notification — Claude's own comments are filtered by _handle_comment_event
+        assert len(mock_session.messages) == 0

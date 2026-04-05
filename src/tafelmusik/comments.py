@@ -1,4 +1,10 @@
-"""Y.Map comment operations — point+quote StickyIndex anchoring."""
+"""Y.Map comment operations — point+quote StickyIndex anchoring.
+
+Transitional: MCP tools no longer call add_comment, list_comments,
+resolve_comment, collect_affected, or reanchor — they use HTTP endpoints
+on the ASGI server (SQLite/TextQuoteSelector). Only clear_all is still
+called (by flush_doc). The browser still uses Y.Map until tfm-kozada.
+"""
 
 from __future__ import annotations
 

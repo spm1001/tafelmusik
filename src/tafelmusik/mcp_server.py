@@ -907,16 +907,6 @@ def _get_state(ctx: Context) -> AppState:
 # --- Tools ---
 
 
-def _reanchor_summary(result: dict) -> str:
-    """Format re-anchoring results as a suffix for edit responses."""
-    parts = []
-    if result["reanchored"]:
-        parts.append(f"{len(result['reanchored'])} comment(s) re-anchored")
-    if result["orphaned"]:
-        parts.append(f"{len(result['orphaned'])} comment(s) orphaned")
-    return f" — {', '.join(parts)}" if parts else ""
-
-
 @mcp.tool()
 async def edit_doc(
     room: str,
@@ -962,54 +952,20 @@ async def edit_doc(
             _log_tool_result("edit_doc", room, t0, msg)
             return msg
         elif mode == "replace_all":
-            comments_map: Map = conn.doc.get("comments", type=Map)
-            doc_len = len(str(conn.text))
-            affected = comments.collect_affected(conn.text, comments_map, 0, doc_len)
             document.replace_all(conn.text, content, author=authors.CLAUDE)
-            result = comments.reanchor(conn.text, comments_map, affected, author=authors.CLAUDE)
-            suffix = _reanchor_summary(result)
-            msg = f"Replaced all content in '{room}' ({len(content)} chars){suffix}"
+            msg = f"Replaced all content in '{room}' ({len(content)} chars)"
             _log_tool_result("edit_doc", room, t0, msg)
             return msg
         elif mode == "replace_section":
             try:
-                comments_map: Map = conn.doc.get("comments", type=Map)
-                doc_content = str(conn.text)
-                heading = content.split("\n", 1)[0].strip()
-                bounds = document.find_section(doc_content, heading)
-                if bounds:
-                    sec_start, sec_end = bounds
-                    affected = comments.collect_affected(
-                        conn.text, comments_map, sec_start, sec_end
-                    )
-                else:
-                    affected = []  # new section — nothing to re-anchor
                 replaced = document.replace_section(conn.text, content, author=authors.CLAUDE)
-                if affected:
-                    # Search within the new section's bounds
-                    new_bounds = document.find_section(str(conn.text), heading)
-                    if new_bounds:
-                        result = comments.reanchor(
-                            conn.text,
-                            comments_map,
-                            affected,
-                            search_start=new_bounds[0],
-                            search_end=new_bounds[1],
-                            author=authors.CLAUDE,
-                        )
-                    else:
-                        result = comments.reanchor(
-                            conn.text, comments_map, affected, author=authors.CLAUDE
-                        )
-                else:
-                    result = {"reanchored": [], "orphaned": []}
             except ValueError as e:
                 msg = str(e)
                 _log_tool_result("edit_doc", room, t0, msg, error=True)
                 return msg
+            heading = content.split("\n", 1)[0].strip()
             verb = "Replaced existing" if replaced else "Appended new"
-            suffix = _reanchor_summary(result)
-            msg = f"{verb} section '{heading}' in '{room}'{suffix}"
+            msg = f"{verb} section '{heading}' in '{room}'"
             _log_tool_result("edit_doc", room, t0, msg)
             return msg
         elif mode == "patch":
@@ -1018,37 +974,13 @@ async def edit_doc(
                 _log_tool_result("edit_doc", room, t0, msg, error=True)
                 return msg
             try:
-                comments_map: Map = conn.doc.get("comments", type=Map)
-                doc_content = str(conn.text)
-                patch_start = doc_content.find(find)
-                if patch_start != -1:
-                    patch_end = patch_start + len(find)
-                    affected = comments.collect_affected(
-                        conn.text, comments_map, patch_start, patch_end
-                    )
-                else:
-                    affected = []
                 document.patch(conn.text, find, replace, author=authors.CLAUDE)
-                if affected:
-                    # Search region: where the patch landed + replacement length
-                    search_end = patch_start + len(replace) if replace else patch_start
-                    result = comments.reanchor(
-                        conn.text,
-                        comments_map,
-                        affected,
-                        search_start=patch_start,
-                        search_end=max(search_end, patch_start + 1),
-                        author=authors.CLAUDE,
-                    )
-                else:
-                    result = {"reanchored": [], "orphaned": []}
             except ValueError as e:
                 msg = f"Patch failed: {e}"
                 _log_tool_result("edit_doc", room, t0, msg, error=True)
                 return msg
             action = "Deleted" if not replace else "Patched"
-            suffix = _reanchor_summary(result)
-            msg = f"{action} {len(find)} chars in '{room}'{suffix}"
+            msg = f"{action} {len(find)} chars in '{room}'"
             _log_tool_result("edit_doc", room, t0, msg)
             return msg
         else:
@@ -1078,13 +1010,8 @@ async def load_doc(room: str, markdown: str, ctx: Context) -> str:
     try:
         state = _get_state(ctx)
         conn = await state.connect(room)
-        comments_map: Map = conn.doc.get("comments", type=Map)
-        doc_len = len(str(conn.text))
-        affected = comments.collect_affected(conn.text, comments_map, 0, doc_len)
         document.replace_all(conn.text, markdown, author=authors.CLAUDE)
-        result = comments.reanchor(conn.text, comments_map, affected, author=authors.CLAUDE)
-        suffix = _reanchor_summary(result)
-        msg = f"Loaded {len(markdown)} chars into '{room}'{suffix}"
+        msg = f"Loaded {len(markdown)} chars into '{room}'"
         _log_tool_result("load_doc", room, t0, msg)
         return msg
     except Exception:
@@ -1222,9 +1149,8 @@ async def inspect_doc(room: str, ctx: Context) -> str:
 async def add_comment(room: str, quote: str, body: str, ctx: Context) -> str:
     """Add a comment anchored to specific text in a document.
 
-    Finds the quote text in the document, creates anchors at that position,
-    and stores the comment in the Y.Map 'comments'. The comment appears in
-    the browser's comments pane with author='claude'.
+    Posts to the ASGI server's comment API. The comment is stored in SQLite
+    and broadcast to all connected peers (including the browser).
 
     Args:
         room: Document room name
@@ -1234,18 +1160,22 @@ async def add_comment(room: str, quote: str, body: str, ctx: Context) -> str:
     t0 = _log_tool_entry("add_comment", room)
     try:
         state = _get_state(ctx)
-        conn = await state.connect(room)
-        comments_map: Map = conn.doc.get("comments", type=Map)
-        try:
-            comments.add_comment(
-                conn.doc, conn.text, comments_map, quote, body, author=authors.CLAUDE
-            )
-        except ValueError as e:
-            msg = str(e)
+        http_url = _ws_to_http(state.server_url)
+        response = await state.client.post(
+            f"{http_url}/api/rooms/{room}/comments",
+            json={"author": authors.CLAUDE, "body": body, "quote": quote},
+        )
+        if response.status_code == 400:
+            msg = response.json().get("error", "Bad request")
             _log_tool_result("add_comment", room, t0, msg, error=True)
             return msg
+        response.raise_for_status()
         msg = f"Comment added on '{room}': {body!r} anchored to {quote!r}"
         _log_tool_result("add_comment", room, t0, msg)
+        return msg
+    except httpx.HTTPError as e:
+        msg = f"Failed to add comment: {e}"
+        _log_tool_result("add_comment", room, t0, msg, error=True)
         return msg
     except Exception:
         _log_tool_error("add_comment", room, t0)
@@ -1256,8 +1186,8 @@ async def add_comment(room: str, quote: str, body: str, ctx: Context) -> str:
 async def list_comments(room: str, ctx: Context) -> str:
     """List all comments on a document.
 
-    Returns comments from the Y.Map 'comments', sorted by document position.
-    Each comment shows: author, quoted text, comment body, and resolved status.
+    Returns comments from the ASGI server's SQLite store, sorted by creation time.
+    Each comment shows: id, author, quoted text, comment body, and resolved status.
 
     Args:
         room: Document room name
@@ -1265,9 +1195,12 @@ async def list_comments(room: str, ctx: Context) -> str:
     t0 = _log_tool_entry("list_comments", room)
     try:
         state = _get_state(ctx)
-        conn = await state.connect(room)
-        comments_map: Map = conn.doc.get("comments", type=Map)
-        entries = comments.list_comments(comments_map)
+        http_url = _ws_to_http(state.server_url)
+        response = await state.client.get(
+            f"{http_url}/api/rooms/{room}/comments",
+        )
+        response.raise_for_status()
+        entries = response.json()
 
         if not entries:
             msg = f"No comments on '{room}'"
@@ -1277,18 +1210,21 @@ async def list_comments(room: str, ctx: Context) -> str:
         lines = [f"Comments on '{room}' — {len(entries)} comment(s):\n"]
         for e in entries:
             flags = []
-            if e["resolved"]:
+            if e.get("resolved"):
                 flags.append("resolved")
-            if e["orphaned"]:
-                flags.append("orphaned")
             status = f" [{', '.join(flags)}]" if flags else ""
-            lines.append(f"  {e['author']}{status}")
-            lines.append(f"  > {e['quote']}")
+            lines.append(f"  [{e['id']}] {e['author']}{status}")
+            if e.get("quote"):
+                lines.append(f"  > {e['quote']}")
             lines.append(f"  {e['body']}")
             lines.append("")
 
         msg = "\n".join(lines)
         _log_tool_result("list_comments", room, t0, msg)
+        return msg
+    except httpx.HTTPError:
+        msg = "Could not list comments (is the Tafelmusik server running?)"
+        _log_tool_result("list_comments", room, t0, msg, error=True)
         return msg
     except Exception:
         _log_tool_error("list_comments", room, t0)
@@ -1299,8 +1235,8 @@ async def list_comments(room: str, ctx: Context) -> str:
 async def resolve_comment(room: str, quote: str, ctx: Context) -> str:
     """Resolve (dismiss) a comment by its quoted text.
 
-    Marks the comment as resolved. It disappears from the browser's
-    comments pane and its yellow underline is removed.
+    Finds the comment matching the quote via the ASGI server's HTTP API,
+    then resolves it. The browser's yellow underline is removed.
 
     Args:
         room: Document room name
@@ -1309,17 +1245,40 @@ async def resolve_comment(room: str, quote: str, ctx: Context) -> str:
     t0 = _log_tool_entry("resolve_comment", room)
     try:
         state = _get_state(ctx)
-        conn = await state.connect(room)
-        comments_map: Map = conn.doc.get("comments", type=Map)
-        resolved_count = comments.resolve_comment(
-            conn.doc, comments_map, quote, author=authors.CLAUDE
+        http_url = _ws_to_http(state.server_url)
+
+        # List comments to find matching ID(s) by quote text
+        response = await state.client.get(
+            f"{http_url}/api/rooms/{room}/comments",
         )
-        if resolved_count == 0:
+        response.raise_for_status()
+        entries = response.json()
+
+        matching = [
+            e for e in entries
+            if not e.get("resolved")
+            and e.get("quote", "").strip() == quote.strip()
+        ]
+
+        if not matching:
             msg = f"No active comment found with quote: {quote!r}"
             _log_tool_result("resolve_comment", room, t0, msg)
             return msg
+
+        resolved_count = 0
+        for entry in matching:
+            r = await state.client.post(
+                f"{http_url}/api/rooms/{room}/comments/{entry['id']}/resolve",
+            )
+            if r.status_code == 200:
+                resolved_count += 1
+
         msg = f"Resolved {resolved_count} comment(s) on '{room}' matching {quote!r}"
         _log_tool_result("resolve_comment", room, t0, msg)
+        return msg
+    except httpx.HTTPError:
+        msg = "Could not resolve comment (is the Tafelmusik server running?)"
+        _log_tool_result("resolve_comment", room, t0, msg, error=True)
         return msg
     except Exception:
         _log_tool_error("resolve_comment", room, t0)
