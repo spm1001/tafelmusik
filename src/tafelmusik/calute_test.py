@@ -9,7 +9,7 @@ import asyncio
 import httpx
 import pytest
 import uvicorn
-from pycrdt import Map, Text
+from pycrdt import Text
 
 from tafelmusik.asgi_server import create_app
 from tafelmusik.conftest import connect_peer, get_free_port
@@ -198,33 +198,6 @@ async def test_flush_creates_parent_dirs(file_server):
 
         assert md_path.exists()
         assert md_path.read_text() == "Nested content"
-
-
-async def test_flush_wipes_comments(file_server):
-    """Flushing clears all comments from the Y.Map."""
-    port, docs_dir, manager = file_server
-
-    async with connect_peer(port, "comment-wipe") as text:
-        text += "Some content"
-        await asyncio.sleep(0.5)
-
-        # Add a comment directly via the server's Doc
-        room = manager.rooms["comment-wipe"]
-        comments_map = room.doc.get("comments", type=Map)
-        with room.doc.transaction():
-            comment = Map()
-            comments_map["test-comment"] = comment
-            comment["body"] = "A test comment"
-            comment["author"] = "sameer"
-
-        assert len(list(comments_map)) == 1
-
-        # Simulate flush comment wipe
-        with room.doc.transaction():
-            for key in list(comments_map):
-                del comments_map[key]
-
-        assert len(list(comments_map)) == 0
 
 
 # --- Round-trip ---

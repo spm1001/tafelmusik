@@ -37,7 +37,7 @@ from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
 from pycrdt import (
     Doc,
-    Map,
+
     Text,
     YMessageType,
     YSyncMessageType,
@@ -46,7 +46,7 @@ from pycrdt import (
     handle_sync_message,
 )
 
-from tafelmusik import authors, comments, document
+from tafelmusik import authors, document
 from tafelmusik.logging_config import (
     configure_call_logging,
     configure_logging,
@@ -105,29 +105,6 @@ def _log_tool_error(op: str, room: str, t0: float) -> None:
     log.warning("op=%s room=%s dur=%.0fms status=error", op, room, dur,
                 exc_info=True)
     log_tool_exception(op, room, dur)
-
-
-_SIGNAL_PATH = Path(os.environ.get(
-    "TAFELMUSIK_SIGNAL", str(Path.home() / ".tafelmusik-signal")
-))
-
-
-def _write_signal(room: str, event: dict, drift: int) -> None:
-    """Write comment event to signal file for FileChanged hook delivery."""
-    try:
-        entry = json_mod.dumps({
-            "room": room,
-            "author": event["author"],
-            "quote": event["quote"],
-            "body": event["body"],
-            "drift": str(drift),
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        })
-        with _SIGNAL_PATH.open("a") as f:
-            f.write(entry + "\n")
-        log.info("signal written to %s", _SIGNAL_PATH)
-    except Exception:
-        log.warning("failed to write signal file", exc_info=True)
 
 
 def _ws_to_http(url: str) -> str:
@@ -421,9 +398,6 @@ async def _comment_consumer(
                     exc_info=True,
                 )
 
-            # Signal file — FileChanged hook delivery (no channel needed)
-            _write_signal(room, event, drift)
-
         # Reset snapshot after high-drift push and cancel idle timer
         # (prevents a redundant resync if the timer fires before next edit)
         if high_drift:
@@ -440,16 +414,17 @@ async def _comment_consumer(
 class RoomConnection:
     """A live connection to a single room on the ASGI server.
 
-    Holds the local Doc (with a Y.Text keyed "content" and Y.Map keyed
-    "comments") and events for sync status and liveness. The sync loop
-    runs in a background task that also owns the WebSocket — they share
-    the same asyncio Task to avoid anyio cancel scope cross-task violations.
+    Holds the local Doc (with a Y.Text keyed "content") and events for
+    sync status and liveness. The sync loop runs in a background task
+    that also owns the WebSocket — they share the same asyncio Task to
+    avoid anyio cancel scope cross-task violations.
 
     Two observers:
     - Text observer: resets idle timer on every remote change. Does NOT
       send notifications directly.
-    - Comment observer: detects new comments from non-Claude authors,
-      queues them for notification via _comment_queue.
+    - Comment handler: HTTP/0x01 comment events from the ASGI broadcast
+      are routed into _comment_queue by _handle_comment_event, consumed
+      by _comment_consumer for channel notifications.
 
     Idle timer: fires after IDLE_TIMEOUT seconds of no remote edits.
     If drift is high, pushes a full resync.
@@ -457,12 +432,10 @@ class RoomConnection:
 
     doc: Doc
     text: Text
-    comments_map: Map
     synced: Event
     dead: Event
     _task: asyncio.Task
     _observe_subscription: Any = None  # text observer (idle timer)
-    _comment_observe_subscription: Any = None  # comment observer
     _comment_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     _comment_consumer_task: asyncio.Task | None = None
     _idle_timer: asyncio.TimerHandle | None = None
@@ -475,9 +448,6 @@ class RoomConnection:
         if self._observe_subscription is not None:
             self.text.unobserve(self._observe_subscription)
             self._observe_subscription = None
-        if self._comment_observe_subscription is not None:
-            self.comments_map.unobserve(self._comment_observe_subscription)
-            self._comment_observe_subscription = None
         if self._comment_consumer_task and not self._comment_consumer_task.done():
             self._comment_consumer_task.cancel()
             try:
@@ -555,7 +525,6 @@ class AppState:
 
         doc = Doc()
         doc["content"] = text = Text()
-        comments_map: Map = doc.get("comments", type=Map)
         synced = Event()
         dead = Event()
         comment_queue: asyncio.Queue = asyncio.Queue()
@@ -644,7 +613,6 @@ class AppState:
         conn = RoomConnection(
             doc=doc,
             text=text,
-            comments_map=comments_map,
             synced=synced,
             dead=dead,
             _task=task,
@@ -680,39 +648,7 @@ class AppState:
             except Exception:
                 log.warning("Text observer callback failed for room", exc_info=True)
 
-        def _on_comments_change(event, txn):
-            """Synchronous observe callback — queues new comments for notification.
-
-            Fires when the Y.Map 'comments' changes. Only queues new comments
-            (action == "add") from non-Claude authors. Edits to existing
-            comments (resolved, re-anchored) are ignored.
-
-            Wrapped in try/except because an unhandled exception here
-            would propagate as an ExceptionGroup when the transaction
-            commits, crashing the sync loop.
-            """
-            try:
-                if txn.origin == authors.CLAUDE:
-                    return
-                for key, change in event.keys.items():
-                    if change["action"] != "add":
-                        continue
-                    new_val = change["newValue"]
-                    if not isinstance(new_val, Map):
-                        continue
-                    conn._comment_queue.put_nowait(
-                        {
-                            "comment_id": key,
-                            "author": new_val.get("author", "unknown"),
-                            "quote": new_val.get("quote", ""),
-                            "body": new_val.get("body", ""),
-                        }
-                    )
-            except Exception:
-                log.warning("Comment observer callback failed for room", exc_info=True)
-
         conn._observe_subscription = text.observe(_on_text_change)
-        conn._comment_observe_subscription = comments_map.observe(_on_comments_change)
         conn._comment_consumer_task = asyncio.create_task(
             _comment_consumer(conn, room)
         )
@@ -834,6 +770,39 @@ def _git_commit_flush(docs_dir: Path, md_path: Path, room: str) -> str:
 
 
 @asynccontextmanager
+async def _parent_watchdog(interval: float = 30.0) -> None:
+    """Exit if the grandparent process (claude) dies.
+
+    Process tree: claude → uv → python (this MCP server). When CC exits
+    uncleanly, uv may survive and keep our stdin socketpair open — we
+    never get EOF. This watchdog checks if the grandparent is still alive
+    and raises SystemExit if not.
+
+    Uses grandparent (not parent) because uv is an intermediary wrapper
+    that can outlive CC.
+    """
+    ppid = os.getppid()  # uv
+    try:
+        grandparent = int(
+            Path(f"/proc/{ppid}/status").read_text()
+            .split("PPid:\t")[1].split("\n")[0]
+        )
+    except (FileNotFoundError, IndexError, ValueError):
+        log.warning("Parent watchdog: can't determine grandparent PID, disabled")
+        return
+
+    log.info("Parent watchdog: tracking grandparent PID %d (interval %.0fs)", grandparent, interval)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            os.kill(grandparent, 0)  # signal 0 = existence check
+        except ProcessLookupError:
+            log.warning("Parent watchdog: grandparent PID %d gone, exiting", grandparent)
+            os._exit(0)
+        except PermissionError:
+            pass  # process exists but we can't signal it — still alive
+
+
 async def lifespan(app: FastMCP) -> AsyncIterator[AppState]:
     configure_logging()
     call_log = configure_call_logging()
@@ -843,9 +812,15 @@ async def lifespan(app: FastMCP) -> AsyncIterator[AppState]:
     async with httpx.AsyncClient() as client:
         state = AppState(client=client, server_url=server_url)
         await state.start_room_poller()
+        watchdog = asyncio.create_task(_parent_watchdog())
         try:
             yield state
         finally:
+            watchdog.cancel()
+            try:
+                await watchdog
+            except asyncio.CancelledError:
+                pass
             await state.close_all()
 
 
@@ -1056,11 +1031,11 @@ async def list_docs(ctx: Context) -> str:
 
 @mcp.tool()
 async def flush_doc(room: str, ctx: Context) -> str:
-    """Flush document to .md file on disk, wipe comments, git commit.
+    """Flush document to .md file on disk and git commit.
 
-    Writes current Y.Text content to the .md file, clears all comments
-    from the Y.Map, and commits the file to git. This is the "save" —
-    the .md file becomes the durable artifact.
+    Writes current Y.Text content to the .md file and commits to git.
+    This is the "save" — the .md file becomes the durable artifact.
+    SQLite comments are not affected by flush.
 
     Args:
         room: Document room name (maps to file path relative to docs_dir)
@@ -1080,17 +1055,12 @@ async def flush_doc(room: str, ctx: Context) -> str:
         md_path.parent.mkdir(parents=True, exist_ok=True)
         md_path.write_text(content)
 
-        # Wipe comments
-        comments_map: Map = conn.doc.get("comments", type=Map)
-        wiped = comments.clear_all(conn.doc, comments_map, author=authors.CLAUDE)
-
         # Git commit — runs in a thread to avoid blocking the event loop.
         git_status = await asyncio.to_thread(
             _git_commit_flush, docs_dir, md_path, room
         )
 
-        comment_note = f" {wiped} comment(s) cleared." if wiped else ""
-        msg = f"Flushed {len(content)} chars to {md_path}.{comment_note}{git_status}"
+        msg = f"Flushed {len(content)} chars to {md_path}.{git_status}"
         _log_tool_result("flush_doc", room, t0, msg)
         return msg
     except Exception:

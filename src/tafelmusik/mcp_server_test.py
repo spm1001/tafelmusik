@@ -11,9 +11,9 @@ import httpx
 import pytest
 import uvicorn
 from anyio import Event
-from pycrdt import Doc, Map, Text, YMessageType, YSyncMessageType
+from pycrdt import Doc, Text, YMessageType, YSyncMessageType
 
-from tafelmusik import authors, comments
+from tafelmusik import authors
 from tafelmusik.asgi_server import create_app
 from tafelmusik.conftest import MockChannel, connect_peer, get_free_port
 from tafelmusik.mcp_server import (
@@ -433,111 +433,6 @@ async def test_text_edit_produces_no_notification(server):
 
 
 
-async def test_comment_observer_fires_on_remote_comment(server):
-    """New comment from non-Claude author queues a notification event."""
-    async with make_state(server) as state:
-        conn = await state.connect("comment-fire-test")
-        conn.text += "Hello world"
-
-        # Simulate browser adding a comment (no origin = same as sync apply)
-        with conn.doc.transaction():
-            c = Map()
-            conn.comments_map["sameer-1"] = c
-            c["author"] = "sameer"
-            c["quote"] = "Hello"
-            c["body"] = "fix this"
-            c["resolved"] = False
-
-        assert not conn._comment_queue.empty()
-        event = conn._comment_queue.get_nowait()
-        assert event["comment_id"] == "sameer-1"
-        assert event["author"] == "sameer"
-        assert event["quote"] == "Hello"
-        assert event["body"] == "fix this"
-
-
-async def test_comment_observer_ignores_claude_comments(server):
-    """Claude's own comments (origin=CLAUDE) produce no notification."""
-    async with make_state(server) as state:
-        conn = await state.connect("self-filter-test")
-        conn.text += "Hello world"
-
-        comments.add_comment(
-            conn.doc, conn.text, conn.comments_map,
-            "Hello", "my comment", author=authors.CLAUDE,
-        )
-
-        assert conn._comment_queue.empty(), "Claude's comment should not notify"
-
-
-async def test_comment_notification_over_wire(server):
-    """Comment added by browser peer arrives via Yjs sync and triggers notification."""
-    mock_session = MockSession()
-
-    async with make_state(server) as state:
-        state.session = mock_session
-        conn = await state.connect("wire-comment-test")
-
-        # Claude writes content the browser peer will comment on
-        conn.text += "The quick brown fox jumps over the lazy dog."
-        await asyncio.sleep(0.5)
-
-        # Browser peer connects, syncs, then adds a comment via its own Doc
-        async with connect_peer(server, "wire-comment-test") as browser_text:
-            # Get the browser's synced Doc and comments Map
-            browser_doc = browser_text.doc
-            browser_comments = browser_doc.get("comments", type=Map)
-
-            with browser_doc.transaction():
-                c = Map()
-                browser_comments["browser-c1"] = c
-                c["author"] = "sameer"
-                c["quote"] = "brown fox"
-                c["body"] = "change to red fox"
-                c["resolved"] = False
-                c["created"] = "2026-03-30T22:00:00Z"
-
-            # Let sync propagate
-            await asyncio.sleep(1.0)
-
-        # Wait for consumer debounce + margin
-        await asyncio.sleep(1.5)
-
-        # MCP server should have received the comment via wire sync
-        assert len(mock_session.messages) > 0
-        notification = mock_session.messages[0].message.root
-        assert notification.method == "notifications/claude/channel"
-        assert "sameer" in notification.params["content"]
-        assert "brown fox" in notification.params["content"]
-        assert "change to red fox" in notification.params["content"]
-
-
-async def test_comment_consumer_debounces(server):
-    """Multiple comments within debounce window are batched then sent individually."""
-    mock_session = MockSession()
-
-    async with make_state(server) as state:
-        state.session = mock_session
-        conn = await state.connect("debounce-test")
-        conn.text += "Hello world foo bar"
-
-        # Rapid-fire 3 comments within debounce window
-        for i in range(3):
-            with conn.doc.transaction():
-                c = Map()
-                conn.comments_map[f"sameer-{i}"] = c
-                c["author"] = "sameer"
-                c["quote"] = ["Hello", "world", "foo"][i]
-                c["body"] = f"comment {i}"
-                c["resolved"] = False
-
-        # Wait for consumer debounce (0.5s) + margin
-        await asyncio.sleep(1.5)
-
-        # All 3 should have been sent (batched into one debounce window)
-        assert len(mock_session.messages) == 3
-
-
 # --- Drift tracking tests (tfm-nocaga) ---
 
 
@@ -581,14 +476,13 @@ async def test_low_drift_comment_sends_comment_only(server):
         drift = _compute_drift(conn, "low-drift-test")
         assert drift <= DRIFT_THRESHOLD
 
-        # Browser adds comment
-        with conn.doc.transaction():
-            c = Map()
-            conn.comments_map["sameer-1"] = c
-            c["author"] = "sameer"
-            c["quote"] = "Hello"
-            c["body"] = "fix this"
-            c["resolved"] = False
+        # Inject comment event directly into queue (same path as 0x01 handler)
+        conn._comment_queue.put_nowait({
+            "comment_id": "sameer-1",
+            "author": "sameer",
+            "quote": "Hello",
+            "body": "fix this",
+        })
 
         await asyncio.sleep(1.5)
 
@@ -616,14 +510,13 @@ async def test_high_drift_comment_sends_full_doc(server):
         drift = _compute_drift(conn, "high-drift-test")
         assert drift > DRIFT_THRESHOLD, f"Drift {drift} should exceed {DRIFT_THRESHOLD}"
 
-        # Browser adds comment
-        with conn.doc.transaction():
-            c = Map()
-            conn.comments_map["sameer-1"] = c
-            c["author"] = "sameer"
-            c["quote"] = "Lorem ipsum"
-            c["body"] = "too much filler"
-            c["resolved"] = False
+        # Inject comment event directly into queue (same path as 0x01 handler)
+        conn._comment_queue.put_nowait({
+            "comment_id": "sameer-1",
+            "author": "sameer",
+            "quote": "Lorem ipsum",
+            "body": "too much filler",
+        })
 
         await asyncio.sleep(1.5)
 
@@ -648,13 +541,12 @@ async def test_high_drift_resets_snapshot_after_push(server):
         assert _compute_drift(conn, "snapshot-reset-test") > DRIFT_THRESHOLD
 
         # First comment triggers resync
-        with conn.doc.transaction():
-            c = Map()
-            conn.comments_map["sameer-1"] = c
-            c["author"] = "sameer"
-            c["quote"] = "xxx"
-            c["body"] = "first"
-            c["resolved"] = False
+        conn._comment_queue.put_nowait({
+            "comment_id": "sameer-1",
+            "author": "sameer",
+            "quote": "xxx",
+            "body": "first",
+        })
 
         await asyncio.sleep(1.5)
 
@@ -663,13 +555,12 @@ async def test_high_drift_resets_snapshot_after_push(server):
         assert drift_after <= DRIFT_THRESHOLD
 
         # Second comment should be comment-only
-        with conn.doc.transaction():
-            c2 = Map()
-            conn.comments_map["sameer-2"] = c2
-            c2["author"] = "sameer"
-            c2["quote"] = "xxx"
-            c2["body"] = "second"
-            c2["resolved"] = False
+        conn._comment_queue.put_nowait({
+            "comment_id": "sameer-2",
+            "author": "sameer",
+            "quote": "xxx",
+            "body": "second",
+        })
 
         await asyncio.sleep(1.5)
 
@@ -948,14 +839,13 @@ async def test_comment_notification_sent_to_session(server):
 
         assert len(mock_session.messages) == 0
 
-        # Simulate browser comment
-        with conn.doc.transaction():
-            c = Map()
-            conn.comments_map["sameer-1"] = c
-            c["author"] = "sameer"
-            c["quote"] = "Hello"
-            c["body"] = "fix this"
-            c["resolved"] = False
+        # Inject comment event directly into queue (same path as 0x01 handler)
+        conn._comment_queue.put_nowait({
+            "comment_id": "sameer-1",
+            "author": "sameer",
+            "quote": "Hello",
+            "body": "fix this",
+        })
 
         # Wait for consumer debounce (0.5s) + margin
         await asyncio.sleep(1.5)
@@ -978,13 +868,13 @@ async def test_comment_waits_for_session(server):
         conn = await state.connect("wait-for-session-test")
         conn.text += "Hello world"
 
-        with conn.doc.transaction():
-            c = Map()
-            conn.comments_map["sameer-1"] = c
-            c["author"] = "sameer"
-            c["quote"] = "Hello"
-            c["body"] = "fix this"
-            c["resolved"] = False
+        # Inject comment event directly into queue (same path as 0x01 handler)
+        conn._comment_queue.put_nowait({
+            "comment_id": "sameer-1",
+            "author": "sameer",
+            "quote": "Hello",
+            "body": "fix this",
+        })
 
         # Consumer is waiting for session — no notification yet
         await asyncio.sleep(1.0)
@@ -1007,13 +897,13 @@ async def test_comment_dropped_when_session_times_out(server):
         conn = await state.connect("no-session-test")
         conn.text += "Hello world"
 
-        with conn.doc.transaction():
-            c = Map()
-            conn.comments_map["sameer-1"] = c
-            c["author"] = "sameer"
-            c["quote"] = "Hello"
-            c["body"] = "fix this"
-            c["resolved"] = False
+        # Inject comment event directly into queue (same path as 0x01 handler)
+        conn._comment_queue.put_nowait({
+            "comment_id": "sameer-1",
+            "author": "sameer",
+            "quote": "Hello",
+            "body": "fix this",
+        })
 
         # Wait for timeout (1s) + consumer debounce (0.5s) + margin
         await asyncio.sleep(3.0)
@@ -1155,157 +1045,6 @@ async def test_room_poller_ignores_already_connected(server):
         # Same connection object — not replaced
         assert state.rooms["already-connected"] is conn
         assert "Existing content" in str(conn.text)
-
-
-async def test_reanchor_comment_survives_replace_section(server):
-    """Y.Map reanchor: browser comment re-anchors after replace_section via StickyIndex.
-
-    Tests comments.collect_affected/reanchor (Y.Map path), NOT the MCP edit_doc tool.
-    MCP tools no longer call these functions — they rely on lazy TextQuoteSelector
-    re-anchoring via the ASGI GET endpoint. This test validates the Y.Map functions
-    themselves, which the browser still uses until tfm-kozada.
-    """
-    import json
-
-    from pycrdt import Assoc, Map, StickyIndex
-
-    from tafelmusik import comments, document
-
-    async with make_state(server) as state:
-        conn = await state.connect("test-reanchor-integration")
-        conn.text += "## Notes\n\nThe API uses REST.\n\nIt supports pagination.\n\n## End\n"
-        await asyncio.sleep(0.5)
-
-        # Simulate browser adding a comment on "The API uses REST"
-        async with connect_peer(server, "test-reanchor-integration") as browser:
-            doc_text = str(browser)
-            idx = doc_text.find("The API uses REST")
-            start_si = StickyIndex.new(browser, idx, assoc=Assoc.AFTER)
-            end_si = StickyIndex.new(browser, idx + len("The API uses REST"), assoc=Assoc.BEFORE)
-
-            comments_map: Map = browser.doc.get("comments", type=Map)
-            with browser.doc.transaction():
-                comment = Map()
-                comments_map["browser-c1"] = comment
-                comment["anchorStart"] = json.dumps(start_si.to_json())
-                comment["anchorEnd"] = json.dumps(end_si.to_json())
-                comment["anchor"] = json.dumps(start_si.to_json())
-                comment["quote"] = "The API uses REST"
-                comment["author"] = "sameer"
-                comment["body"] = "Consider GraphQL"
-                comment["resolved"] = False
-            await asyncio.sleep(0.5)
-
-        # Wait for comment to sync to MCP
-        await asyncio.sleep(0.5)
-
-        # MCP does replace_section with re-anchoring
-        mcp_comments: Map = conn.doc.get("comments", type=Map)
-        doc_content = str(conn.text)
-        heading = "## Notes"
-        bounds = document.find_section(doc_content, heading)
-        affected = comments.collect_affected(conn.text, mcp_comments, bounds[0], bounds[1])
-        document.replace_section(
-            conn.text,
-            "## Notes\n\nNew intro.\n\nThe API uses REST and GraphQL.\n",
-            author=authors.CLAUDE,
-        )
-        new_bounds = document.find_section(str(conn.text), heading)
-        result = comments.reanchor(
-            conn.text,
-            mcp_comments,
-            affected,
-            search_start=new_bounds[0],
-            search_end=new_bounds[1],
-            author=authors.CLAUDE,
-        )
-
-        assert "browser-c1" in result["reanchored"]
-        # Verify the comment's anchor resolves to the right position in new text
-        new_content = str(conn.text)
-        expected_idx = new_content.find("The API uses REST")
-        anchor_json = json.loads(mcp_comments["browser-c1"]["anchorStart"])
-        si = StickyIndex.from_json(anchor_json, conn.text)
-        assert si.get_index() == expected_idx
-
-        await asyncio.sleep(0.5)
-
-    # Verify the re-anchored comment synced back to a new client
-    async with connect_peer(server, "test-reanchor-integration") as text:
-        comments_map: Map = text.doc.get("comments", type=Map)
-        comment = comments_map["browser-c1"]
-        assert comment.get("quote") == "The API uses REST"
-        assert comment.get("orphaned") is None or comment.get("orphaned") is False
-
-
-async def test_reanchor_comment_orphaned_over_wire(server):
-    """Y.Map reanchor: browser comment orphaned when quote deleted via StickyIndex path.
-
-    Tests comments.collect_affected/reanchor (Y.Map path), NOT the MCP edit_doc tool.
-    See test_reanchor_comment_survives_replace_section for context.
-    """
-    import json
-
-    from pycrdt import Assoc, Map, StickyIndex
-
-    from tafelmusik import comments, document
-
-    async with make_state(server) as state:
-        conn = await state.connect("test-orphan-integration")
-        conn.text += "## Notes\n\nUse pagination for results.\n\n## End\n"
-        await asyncio.sleep(0.5)
-
-        # Browser adds comment
-        async with connect_peer(server, "test-orphan-integration") as browser:
-            doc_text = str(browser)
-            idx = doc_text.find("Use pagination")
-            start_si = StickyIndex.new(browser, idx, assoc=Assoc.AFTER)
-
-            comments_map: Map = browser.doc.get("comments", type=Map)
-            with browser.doc.transaction():
-                comment = Map()
-                comments_map["browser-c2"] = comment
-                comment["anchor"] = json.dumps(start_si.to_json())
-                comment["anchorStart"] = json.dumps(start_si.to_json())
-                end_si = StickyIndex.new(browser, idx + len("Use pagination"), assoc=Assoc.BEFORE)
-                comment["anchorEnd"] = json.dumps(end_si.to_json())
-                comment["quote"] = "Use pagination"
-                comment["author"] = "sameer"
-                comment["body"] = "offset/limit?"
-                comment["resolved"] = False
-            await asyncio.sleep(0.5)
-
-        await asyncio.sleep(0.5)
-
-        # MCP replaces section — quote text gone
-        mcp_comments: Map = conn.doc.get("comments", type=Map)
-        doc_content = str(conn.text)
-        bounds = document.find_section(doc_content, "## Notes")
-        affected = comments.collect_affected(conn.text, mcp_comments, bounds[0], bounds[1])
-        document.replace_section(
-            conn.text,
-            "## Notes\n\nResults are streamed.\n",
-            author=authors.CLAUDE,
-        )
-        new_bounds = document.find_section(str(conn.text), "## Notes")
-        result = comments.reanchor(
-            conn.text,
-            mcp_comments,
-            affected,
-            search_start=new_bounds[0],
-            search_end=new_bounds[1],
-            author=authors.CLAUDE,
-        )
-
-        assert "browser-c2" in result["orphaned"]
-        assert mcp_comments["browser-c2"]["orphaned"] is True
-
-        await asyncio.sleep(0.5)
-
-    # Verify orphaned flag synced
-    async with connect_peer(server, "test-orphan-integration") as text:
-        comments_map: Map = text.doc.get("comments", type=Map)
-        assert comments_map["browser-c2"]["orphaned"] is True
 
 
 def test_heading_level_detection():
