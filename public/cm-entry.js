@@ -28,7 +28,6 @@ function init() {
 
   const ydoc = new Y.Doc();
   const ytext = ydoc.getText("content");
-  const comments = ydoc.getMap("comments");
 
   const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const wsUrl = `${wsProto}//${window.location.host}/_ws`;
@@ -45,11 +44,53 @@ function init() {
     }
   }, 10000);
 
+  // --- WebSocket 0x01 interception ---
+  // Server broadcasts comment events as 0x01 + JSON over the CRDT WebSocket.
+  // y-websocket interprets byte 0x01 as awareness — wrapping ws.onmessage
+  // intercepts comment messages before y-websocket tries to parse them.
+  function installCommentHook() {
+    const ws = provider.ws;
+    if (!ws || ws._tfmHooked) return;
+    ws._tfmHooked = true;
+    const orig = ws.onmessage;
+    ws.onmessage = function(event) {
+      if (event.data instanceof ArrayBuffer) {
+        const data = new Uint8Array(event.data);
+        if (data[0] === 0x01) {
+          try {
+            const json = new TextDecoder().decode(data.slice(1));
+            handleCommentEvent(JSON.parse(json));
+          } catch (e) { console.error("[tfm] comment event parse:", e); }
+          return;
+        }
+      }
+      if (orig) orig.call(this, event);
+    };
+  }
+
+  function handleCommentEvent(event) {
+    if (event.type === "comment_resolved") {
+      // Optimistic remove — render immediately, fetch confirms
+      httpComments = httpComments.filter((h) => h.id !== event.comment.id);
+      resolveRanges();
+      renderComments();
+      if (view) {
+        try { view.dispatch({}); } catch (e) { console.error("[tfm] dispatch after comment event:", e); }
+      }
+    }
+    // Re-fetch for authoritative anchor positions — broadcast payload
+    // doesn't include server-computed anchors. Coalesced via scheduleFetch.
+    scheduleFetch();
+  }
+
   provider.on("status", ({status}) => {
     const el = document.getElementById("connection-status");
     el.textContent = status === "connected" ? "connected" : status;
     el.className = "status " + status;
-    if (status !== "connected") {
+    if (status === "connected") {
+      // Hook into the (possibly new) WebSocket for 0x01 comment events
+      setTimeout(installCommentHook, 0);
+    } else {
       console.warn(`[tfm] room=${room} connection status:`, status, new Error().stack);
     }
   });
@@ -90,68 +131,61 @@ function init() {
     renderComments();
   }
 
-  // --- Resolve comment ranges ---
+  // --- HTTP comment state ---
+
+  let httpComments = []; // cached from server
+  let fetchTimer = null;
+
+  async function fetchComments() {
+    try {
+      const res = await fetch(`/api/rooms/${room}/comments`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      httpComments = await res.json();
+      resolveRanges();
+      renderComments();
+      // Trigger decoration rebuild — ViewPlugin.update only fires on doc/selection changes
+      if (view) {
+        try { view.dispatch({}); } catch (e) { /* editor may not be ready */ }
+      }
+    } catch (e) {
+      console.error("[tfm] fetchComments failed:", e);
+    }
+  }
+
+  // All comment-data refreshes go through this single debounced gate.
+  // Immediate=true skips the delay (initial load, sync). Default 100ms
+  // coalesces rapid WS events without the 500ms lag of doc-change refetch.
+  function scheduleFetch(delayMs = 100) {
+    if (fetchTimer) clearTimeout(fetchTimer);
+    fetchTimer = setTimeout(() => { fetchTimer = null; fetchComments(); }, delayMs);
+  }
+
+  // --- Resolve comment ranges from HTTP data ---
+
+  let commentsVersion = 0; // bumped when commentRanges changes — dirty flag for decorations
 
   function resolveRanges() {
     const ranges = [];
     const orphans = [];
-    const docText = view ? view.state.doc.toString() : "";
+    const docLen = view ? view.state.doc.length : 0;
 
-    comments.forEach((comment, id) => {
-      if (!(comment instanceof Y.Map)) return;
-      if (comment.get("resolved")) return;
+    for (const c of httpComments) {
+      if (c.resolved) continue;
+      if (!c.quote) continue;
 
-      const quote = comment.get("quote");
-      if (!quote) return;
-
-      if (comment.get("orphaned")) {
-        orphans.push({id, quote, body: comment.get("body"), author: comment.get("author"), created: comment.get("created") || ""});
-        return;
+      if (c.anchor && c.anchor.start != null && c.anchor.end != null) {
+        const from = c.anchor.start;
+        const to = c.anchor.end;
+        if (from >= 0 && to > from && to <= docLen) {
+          ranges.push({from, to, id: c.id, quote: c.quote, body: c.body, author: c.author, created: c.created || ""});
+          continue;
+        }
       }
 
-      try {
-        let from = -1, to = -1;
+      // No valid anchor — orphaned
+      orphans.push({id: c.id, quote: c.quote, body: c.body, author: c.author, created: c.created || ""});
+    }
 
-        const startJson = comment.get("anchorStart");
-        const endJson = comment.get("anchorEnd");
-        if (startJson && endJson) {
-          const startPos = Y.createAbsolutePositionFromRelativePosition(
-            Y.createRelativePositionFromJSON(JSON.parse(startJson)), ydoc);
-          const endPos = Y.createAbsolutePositionFromRelativePosition(
-            Y.createRelativePositionFromJSON(JSON.parse(endJson)), ydoc);
-          if (startPos && endPos && startPos.index < endPos.index) {
-            from = startPos.index;
-            to = endPos.index;
-          }
-        }
-
-        if (from === -1) {
-          const anchorJson = comment.get("anchor");
-          if (!anchorJson) return;
-          const relPos = Y.createRelativePositionFromJSON(JSON.parse(anchorJson));
-          const absPos = Y.createAbsolutePositionFromRelativePosition(relPos, ydoc);
-          if (!absPos) return;
-
-          const idx = absPos.index;
-          const searchFrom = Math.max(0, idx - quote.length);
-          const searchTo = Math.min(docText.length, idx + quote.length * 2);
-          const region = docText.slice(searchFrom, searchTo);
-          const match = region.indexOf(quote);
-          if (match === -1) return;
-          from = searchFrom + match;
-          to = from + quote.length;
-        }
-
-        if (from >= 0 && to > from && to <= docText.length) {
-          ranges.push({from, to, id, quote, body: comment.get("body"), author: comment.get("author"), created: comment.get("created") || ""});
-        }
-      } catch (e) {
-        console.error(`[tfm] resolveRanges: comment ${id} failed:`, e);
-      }
-    });
-
-    // Comments with overlapping ranges are "same conversation" → sort by creation time.
-    // Non-overlapping comments sort by document position.
     ranges.sort((a, b) => {
       const overlaps = a.from < b.to && b.from < a.to;
       if (overlaps) return a.created.localeCompare(b.created);
@@ -159,19 +193,21 @@ function init() {
     });
     commentRanges = ranges;
     orphanedComments = orphans;
+    commentsVersion++;
   }
 
   // --- Comment decorations ---
 
-  const commentPlugin = ViewPlugin.define((v) => {
-    let alive = true;
+  // Doc-change refetch: longer debounce (500ms) since typing is continuous.
+  // Uses the same scheduleFetch gate — a shorter-delay WS event will override.
+  function scheduleRefetch() { scheduleFetch(500); }
 
+  const commentPlugin = ViewPlugin.define(() => {
     const plugin = {
       decorations: Decoration.none,
+      _lastVersion: -1,
 
       rebuild() {
-        resolveRanges();
-        // Decorations must be added in strict from-position order
         const decoRanges = [...commentRanges].sort((a, b) => a.from - b.from || a.to - b.to);
         const builder = new RangeSetBuilder();
         for (const r of decoRanges) {
@@ -181,52 +217,26 @@ function init() {
       },
 
       update(update) {
-        if (update.docChanged) {
+        if (this._lastVersion !== commentsVersion) {
+          this._lastVersion = commentsVersion;
           this.rebuild();
-          renderComments();
+        }
+        if (update.docChanged) {
+          scheduleRefetch();
         }
         if (update.selectionSet && view) {
-          // Ignore programmatic selections (card clicks)
           if (update.transactions.some((t) => t.annotation(programmatic))) return;
 
           const {from, to} = update.state.selection.main;
           if (from !== to) {
-            // User selected text → enter or update commenting
             const text = update.state.doc.sliceString(from, to);
             enterCommenting({from, to, text});
           } else if (mode === "commenting") {
-            // Selection collapsed → return to document if compose is empty
             if (composeView.state.doc.length === 0) enterDocument();
           }
         }
       },
-
-      destroy() {
-        alive = false;
-        comments.unobserveDeep(observer);
-      },
     };
-
-    // Debounce the Y.Map observer — a single ydoc.transact() that sets
-    // multiple fields fires observeDeep once per field. Without debouncing,
-    // each field triggers rebuild + renderComments + dispatch, causing DOM
-    // thrashing that blocks the main thread long enough to blip the WebSocket.
-    let observerTimer = null;
-    const observer = () => {
-      if (!alive) return;
-      if (observerTimer) return; // already scheduled
-      observerTimer = requestAnimationFrame(() => {
-        observerTimer = null;
-        if (!alive) return;
-        plugin.rebuild();
-        const wasCommenting = mode === "commenting";
-        renderComments();
-        if (wasCommenting) composeView.focus();
-        try { v.dispatch({}); } catch (e) { console.error("[tfm] dispatch after comment update failed:", e); }
-      });
-    };
-    comments.observeDeep(observer);
-
     return plugin;
   }, {
     decorations: (v) => v.decorations,
@@ -256,21 +266,22 @@ function init() {
 
     const {from, to, text} = capturedSelection;
 
-    ydoc.transact(() => {
-      const comment = new Y.Map();
-      const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
-      comments.set(id, comment);
-      const startRelPos = Y.createRelativePositionFromTypeIndex(ytext, from);
-      const endRelPos = Y.createRelativePositionFromTypeIndex(ytext, to);
-      comment.set("anchorStart", JSON.stringify(Y.relativePositionToJSON(startRelPos)));
-      comment.set("anchorEnd", JSON.stringify(Y.relativePositionToJSON(endRelPos)));
-      comment.set("anchor", JSON.stringify(Y.relativePositionToJSON(startRelPos)));
-      comment.set("quote", text);
-      comment.set("author", "sameer");
-      comment.set("body", body);
-      comment.set("resolved", false);
-      comment.set("created", new Date().toISOString());
+    // Optimistic add — comment appears immediately, fetch overwrites with server data
+    httpComments.push({
+      id: "_pending_" + Date.now(),
+      author: "sameer", body, quote: text,
+      created: new Date().toISOString(),
+      anchor: {start: from, end: to},
     });
+    resolveRanges();
+
+    // POST to HTTP endpoint — server computes prefix/suffix from live doc
+    fetch(`/api/rooms/${room}/comments`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({author: "sameer", body, quote: text}),
+    }).then(() => scheduleFetch()) // replace optimistic entry with server data
+      .catch((e) => console.error("[tfm] submitComment failed:", e));
 
     enterDocument();
     if (view) view.focus();
@@ -365,8 +376,8 @@ function init() {
       resolve.textContent = "Resolve";
       resolve.addEventListener("click", (e) => {
         e.stopPropagation();
-        const comment = comments.get(range.id);
-        if (comment) comment.set("resolved", true);
+        fetch(`/api/rooms/${room}/comments/${range.id}/resolve`, {method: "POST"})
+          .catch((err) => console.error("[tfm] resolve failed:", err));
       });
 
       card.append(author, quote, body, resolve);
@@ -410,8 +421,8 @@ function init() {
       resolve.textContent = "Resolve";
       resolve.addEventListener("click", (e) => {
         e.stopPropagation();
-        const comment = comments.get(orphan.id);
-        if (comment) comment.set("resolved", true);
+        fetch(`/api/rooms/${room}/comments/${orphan.id}/resolve`, {method: "POST"})
+          .catch((err) => console.error("[tfm] resolve failed:", err));
       });
 
       card.append(author, quote, body, resolve);
@@ -490,8 +501,7 @@ function init() {
 
   provider.on("sync", (synced) => {
     if (synced) {
-      resolveRanges();
-      renderComments();
+      fetchComments();
     }
   });
 

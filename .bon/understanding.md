@@ -24,9 +24,11 @@ Deep Research found that CM6's OT collab doesn't guarantee position convergence 
 
 `anchored.py` (200 lines, 28 tests) — the standalone comment system with content-addressed anchoring. `playground.py` — interactive CLI for playing with comments on real files. tmux integration (Ctrl-b C popup for quick reactions anchored to selected text). This eliminated the manual serialisation loop (copy from TUI → paste in editor → structure → paste back).
 
-### Migration status (tfm-mezaza, complete)
+### Migration status (tfm-kozada, complete)
 
-MCP comment tools (`add_comment`, `list_comments`, `resolve_comment`) now use HTTP endpoints on the ASGI server instead of Y.Map operations. Comments live in SQLite, anchored via TextQuoteSelector. Re-anchoring is lazy — computed on read, not maintained on write. `edit_doc` and `load_doc` no longer call `collect_affected`/`reanchor`. The Y.Map observer still runs for browser comments (until tfm-kozada). `flush_doc` still clears Y.Map but does not touch SQLite — this is a transitional asymmetry that resolves when the browser moves off Y.Map.
+All three surfaces — MCP tools, browser, tmux — now use HTTP/SQLite for comments. MCP tools use HTTP endpoints on the ASGI server. Browser fetches/creates/resolves via HTTP, receives real-time updates via 0x01 WebSocket broadcasts (intercepted before y-websocket can misparse them as awareness). Re-anchoring is lazy — computed on read via server-side 4-strategy cascade, not maintained on write. The browser debounce-refetches on doc changes (500ms) for updated anchor positions.
+
+**Dead Y.Map code remaining:** `comments.py` module, Y.Map observer in `mcp_server.py`, `flush_doc`'s `clear_all` call on an empty Y.Map. All deletable after tfm-kokudo. `flush_doc` still clears Y.Map (no-op) but does not touch SQLite comments — SQLite comments survive flush by design.
 
 ## The files-on-disk pivot (calute)
 
@@ -57,7 +59,8 @@ CC session ID available at `~/.claude/sessions/{PID}.json` (sessionId UUID, cwd,
 
 - **Well-drawn bons replace plan files:** When bons have clear `--what` with numbered steps, `--how` with approach constraints, and `--done` with verifiable criteria, busking (no plan file, no plan mode) works. The test: after creating a bon, could you delete the plan file with no information loss? If yes, the information is in the right place.
 - **Bisect async layers:** Test each pair of libraries in isolation before reasoning about the whole stack.
-- **Review while context is hot:** Ask "what did we miss" immediately after implementing, before committing.
+- **Review while context is hot:** Ask "what did we miss" immediately after implementing, before committing. The triage table pattern (reflection → consequence → remedy → timing) bridges observations to actions — keeps the causal link that free-form "thoughts then actions" loses.
 - **Niche libraries:** Read source to understand the protocol, then implement yourself using public APIs.
 - **System observables before instrumentation:** When a server misbehaves, start with what the kernel already knows (`/proc/PID/fd`, `lsof`, `ss`, `ps aux`) before building logging or metrics. The telemetry is already there — read it first.
 - **Context managers lie about cleanup:** Python's `with sqlite3.connect(path) as conn:` commits/rolls back but does NOT close the connection. This caused a production outage (one leaked FD per `/api/rooms` call, FD limit hit in ~10 minutes). Broader lesson: for any database library, check what `__exit__` actually does — don't assume resource cleanup. Always `try/finally: conn.close()`.
+- **Migrations have a documentation surface area.** When migrating an intermediate layer (e.g. Y.Map → HTTP/SQLite), the code change is the easy part. CLAUDE.md, understanding.md, bon briefs, test docstrings, tool descriptions, module docstrings, and skill instructions all encode assumptions about which system is active. Every surface a future Claude reads becomes a potential source of wrong assumptions. Budget explicitly for documentation sweep — it's part of the migration, not cleanup after it.
