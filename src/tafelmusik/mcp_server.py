@@ -22,7 +22,7 @@ import logging
 import os
 import subprocess
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -182,6 +182,7 @@ async def _sync_loop(
     synced: Event,
     *,
     keepalive: float | None = 60.0,
+    on_comment: Callable[[dict], None] | None = None,
 ) -> None:
     """Run the Yjs sync protocol over a channel.
 
@@ -242,6 +243,13 @@ async def _sync_loop(
                     await channel.send(reply)
                 if msg_type == YSyncMessageType.SYNC_STEP2 and not synced.is_set():
                     synced.set()
+            elif message[0] == 0x01 and on_comment is not None:
+                # Comment event — type prefix from asgi_server.COMMENT_MSG_TYPE
+                try:
+                    event = json_mod.loads(message[1:])
+                    on_comment(event)
+                except Exception:
+                    log.warning("Failed to parse comment event", exc_info=True)
         # Channel iterator ended — connection lost. Cancel _send_updates
         # so this function returns and the caller can set the dead event.
         tg.cancel_scope.cancel()
@@ -550,6 +558,26 @@ class AppState:
         comments_map: Map = doc.get("comments", type=Map)
         synced = Event()
         dead = Event()
+        comment_queue: asyncio.Queue = asyncio.Queue()
+
+        def _handle_comment_event(event: dict) -> None:
+            """Route HTTP-created comment events into the notification queue.
+
+            Called synchronously from _sync_loop when a 0x01 message arrives
+            on the WebSocket. Only queues comment_created events from non-Claude
+            authors — resolved events and Claude's own comments are filtered.
+            """
+            if event.get("type") != "comment_created":
+                return
+            comment = event.get("comment", {})
+            if comment.get("author") == authors.CLAUDE:
+                return
+            comment_queue.put_nowait({
+                "comment_id": comment.get("id", ""),
+                "author": comment.get("author", "unknown"),
+                "quote": comment.get("quote", ""),
+                "body": comment.get("body", ""),
+            })
 
         async def _sync_task():
             """Run WebSocket + sync protocol in the same asyncio Task.
@@ -561,7 +589,11 @@ class AppState:
             try:
                 async with aconnect_ws(f"{http_url}/_ws/{room}", self.client) as ws:
                     channel = WebSocketChannel(ws)
-                    await _sync_loop(doc, channel, synced, keepalive=self.keepalive)
+                    await _sync_loop(
+                        doc, channel, synced,
+                        keepalive=self.keepalive,
+                        on_comment=_handle_comment_event,
+                    )
             except Exception:
                 log.warning("Sync task for room %s failed", room, exc_info=True)
             finally:
@@ -616,6 +648,7 @@ class AppState:
             synced=synced,
             dead=dead,
             _task=task,
+            _comment_queue=comment_queue,
             _app_state=self,
         )
 

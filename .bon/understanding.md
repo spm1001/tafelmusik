@@ -54,3 +54,5 @@ CC session ID available at `~/.claude/sessions/{PID}.json` (sessionId UUID, cwd,
 - **Bisect async layers:** Test each pair of libraries in isolation before reasoning about the whole stack.
 - **Review while context is hot:** Ask "what did we miss" immediately after implementing, before committing.
 - **Niche libraries:** Read source to understand the protocol, then implement yourself using public APIs.
+- **System observables before instrumentation:** When a server misbehaves, start with what the kernel already knows (`/proc/PID/fd`, `lsof`, `ss`, `ps aux`) before building logging or metrics. The telemetry is already there — read it first.
+- **Context managers lie about cleanup:** Python's `with sqlite3.connect(path) as conn:` commits/rolls back but does NOT close the connection. This caused a production outage (one leaked FD per `/api/rooms` call, FD limit hit in ~10 minutes). Broader lesson: for any database library, check what `__exit__` actually does — don't assume resource cleanup. Always `try/finally: conn.close()`.

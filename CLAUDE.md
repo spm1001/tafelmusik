@@ -114,3 +114,5 @@ This means Claude can act from context (the comment quote + instruction is often
 - No `pycrdt-websocket` dependency anywhere — `pycrdt` + `pycrdt-store` only.
 - `text[start:end] = new_content` does delete+insert but strips formatting attrs. Use `del text[start:end]` + `text.insert(start, content, attrs=...)` to preserve authorship. `document.py` handles this — call its functions rather than operating on Text directly.
 - `text.clear()` removes all content (equivalent to `del text[:]`).
+- **Starlette `Route()` without `methods` is GET-only.** It does NOT accept all HTTP methods — POST will return 405. Always pass `methods=["GET", "POST"]` explicitly.
+- **CommentStore in ASGI server is deliberately synchronous.** The persistent SQLite connection handles microsecond ops on a tiny table. Do NOT wrap in `asyncio.to_thread()` — that introduces thread-safety issues on the shared connection. Different from `_query_persisted_rooms` which opens/closes a fresh connection per call.

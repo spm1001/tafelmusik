@@ -5,6 +5,7 @@ functions, SQLiteYStore). No dependency on pycrdt.websocket.
 """
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -28,6 +29,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from tafelmusik.anchored import Comment, CommentStore, anchor, capture_context
 from tafelmusik.logging_config import configure_event_logging, configure_logging, log_event
 
 PORT = 3456
@@ -187,6 +189,12 @@ class Room:
             log.info("Room %s: client disconnected (%d remaining)", self.name, len(self.channels))
             log_event("client_disconnected", self.name, clients=len(self.channels))
 
+    async def broadcast(self, message: bytes) -> None:
+        """Send an arbitrary message to all connected channels."""
+        channels = list(self.channels)
+        if channels:
+            await asyncio.gather(*(self._safe_send(ch, message) for ch in channels))
+
 
 class RoomManager:
     """Manages document rooms with lazy creation and persistence restore."""
@@ -257,6 +265,28 @@ class RoomManager:
         self.rooms.clear()
 
 
+# --- Comment events: WebSocket multiplexing ---
+
+COMMENT_MSG_TYPE = b'\x01'
+
+
+def _comment_dict(c: Comment, anchor_pos: dict | None = None) -> dict:
+    d = {
+        "id": c.id, "author": c.author, "created": c.created,
+        "target": c.target, "body": c.body,
+        "quote": c.quote, "prefix": c.prefix, "suffix": c.suffix,
+        "replies_to": c.replies_to, "resolved": c.resolved,
+    }
+    if anchor_pos:
+        d["anchor"] = anchor_pos
+    return d
+
+
+def _comment_event(event_type: str, comment: Comment) -> bytes:
+    payload = json.dumps({"type": event_type, "comment": _comment_dict(comment)})
+    return COMMENT_MSG_TYPE + payload.encode()
+
+
 # --- App factory ---
 
 
@@ -290,6 +320,9 @@ def create_app(
     )
 
     manager = RoomManager(store_cls=Store, docs_dir=_docs_dir)
+
+    _comments_db = str(Path(db_path).parent / "comments.db")
+    comment_store = CommentStore(_comments_db)
 
     async def websocket_endpoint(websocket: WebSocket):
         room_name = websocket.path_params.get("room", "default")
@@ -379,11 +412,95 @@ def create_app(
         ]
         return JSONResponse({"rooms": rooms})
 
+    async def handle_comments(request):
+        """GET: list comments for a room. POST: create a comment."""
+        room_name = request.path_params["room"]
+        if request.method == "GET":
+            include_resolved = request.query_params.get("resolved", "false") == "true"
+            comments = comment_store.list_for_target(
+                room_name, include_resolved=include_resolved
+            )
+
+            anchors = {}
+            if room_name in manager.rooms:
+                text = manager.rooms[room_name].doc.get("content", type=Text)
+                content = str(text)
+                for c in comments:
+                    if c.quote:
+                        result = anchor(content, c.quote, c.prefix, c.suffix)
+                        if result:
+                            anchors[c.id] = {
+                                "start": result.start,
+                                "end": result.end,
+                                "confident": result.confident,
+                            }
+
+            return JSONResponse([
+                _comment_dict(c, anchor_pos=anchors.get(c.id))
+                for c in comments
+            ])
+
+        # POST — create comment
+        data = await request.json()
+        for required in ("author", "body"):
+            if required not in data:
+                return JSONResponse(
+                    {"error": f"missing required field: {required}"},
+                    status_code=400,
+                )
+        quote = data.get("quote")
+        prefix = data.get("prefix")
+        suffix = data.get("suffix")
+
+        # Compute anchor context from live document if not provided
+        if quote and not prefix and room_name in manager.rooms:
+            text = manager.rooms[room_name].doc.get("content", type=Text)
+            content = str(text)
+            result = anchor(content, quote)
+            if result:
+                prefix, suffix = capture_context(content, result.start, result.end)
+
+        comment = comment_store.create(
+            author=data["author"],
+            target=room_name,
+            body=data["body"],
+            quote=quote,
+            prefix=prefix,
+            suffix=suffix,
+            replies_to=data.get("replies_to"),
+        )
+
+        # Broadcast to room peers
+        if room_name in manager.rooms:
+            await manager.rooms[room_name].broadcast(
+                _comment_event("comment_created", comment)
+            )
+
+        log_event("comment_created", room_name, author=data["author"], comment_id=comment.id)
+        return JSONResponse(_comment_dict(comment), status_code=201)
+
+    async def resolve_comment(request):
+        """Mark a comment as resolved and broadcast to room peers."""
+        comment_id = request.path_params["comment_id"]
+        room_name = request.path_params["room"]
+        comment = comment_store.resolve(comment_id)
+        if not comment:
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        if room_name in manager.rooms:
+            await manager.rooms[room_name].broadcast(
+                _comment_event("comment_resolved", comment)
+            )
+
+        log_event("comment_resolved", room_name, comment_id=comment_id)
+        return JSONResponse(_comment_dict(comment))
+
     @asynccontextmanager
     async def lifespan(app):
         try:
             yield
         finally:
+            comment_store.close()
             await manager.close()
 
     _public_dir = str(public_dir)
@@ -396,6 +513,11 @@ def create_app(
         lifespan=lifespan,
         routes=[
             Route("/api/rooms", list_rooms),
+            Route(
+                "/api/rooms/{room:path}/comments/{comment_id}/resolve",
+                resolve_comment, methods=["POST"],
+            ),
+            Route("/api/rooms/{room:path}/comments", handle_comments, methods=["GET", "POST"]),
             WebSocketRoute("/_ws/{room:path}", websocket_endpoint),
             Mount("/static", StaticFiles(directory=_public_dir)),
             Route("/{path:path}", spa_fallback),
@@ -403,6 +525,7 @@ def create_app(
         ],
     )
     app.state.manager = manager
+    app.state.comment_store = comment_store
     return app
 
 

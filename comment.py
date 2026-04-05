@@ -2,27 +2,31 @@
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
-"""Store a comment anchored to tmux selection.
+"""Post a comment to the Tafelmusik server, anchored to tmux selection.
 
 Usage:
-    echo "my reaction" | uv run --script comment.py [--target TARGET]
+    echo "my reaction" | uv run --script comment.py [--target ROOM]
 
 Reads the tmux buffer for the quote (the selected text).
 Reads stdin for the body (the comment).
-Stores in ~/.tafelmusik-comments.db.
+POSTs to the Tafelmusik ASGI server's comment endpoint.
+
+If --target is not specified, auto-discovers the active room from the server.
+Server URL from TAFELMUSIK_URL env var (default: http://hezza:3456).
 """
 
+import json
 import os
 import subprocess
 import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-
-from pathlib import Path
-from tafelmusik.anchored import CommentStore, capture_context
+import urllib.error
+import urllib.request
 
 
-DB_PATH = Path.home() / ".tafelmusik-comments.db"
+def _server_url() -> str:
+    """Get HTTP base URL from TAFELMUSIK_URL env var."""
+    url = os.environ.get("TAFELMUSIK_URL", "http://hezza:3456")
+    return url.replace("ws://", "http://").replace("wss://", "https://")
 
 
 def get_tmux_buffer() -> str | None:
@@ -39,22 +43,47 @@ def get_tmux_buffer() -> str | None:
     return None
 
 
-def get_target() -> str:
-    """Derive a target from args or default."""
+def get_session_id() -> str | None:
+    """Get CC session ID from the most recent session file."""
+    session_dir = os.path.expanduser("~/.claude/sessions")
+    if not os.path.isdir(session_dir):
+        return None
+    try:
+        files = [
+            os.path.join(session_dir, f)
+            for f in os.listdir(session_dir)
+            if f.endswith(".json")
+        ]
+        if not files:
+            return None
+        # Most recent session file
+        latest = max(files, key=os.path.getmtime)
+        with open(latest) as f:
+            data = json.load(f)
+        return data.get("sessionId")
+    except Exception:
+        return None
+
+
+def get_target() -> str | None:
+    """Get room name from --target arg or auto-discover active room."""
     for i, arg in enumerate(sys.argv):
         if arg == "--target" and i + 1 < len(sys.argv):
             return sys.argv[i + 1]
-    # Default: current tmux session:window
+    # Auto-discover: query server for active rooms
     try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-p", "#{session_name}:#{window_name}"],
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode == 0:
-            return f"tmux/{result.stdout.strip()}"
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        url = f"{_server_url()}/api/rooms"
+        response = urllib.request.urlopen(url, timeout=2)
+        data = json.loads(response.read())
+        rooms = data.get("rooms", [])
+        active = [r["name"] for r in rooms if r.get("active")]
+        if active:
+            if len(active) > 1:
+                print(f"Multiple active rooms, using: {active[0]}", file=sys.stderr)
+            return active[0]
+    except Exception:
         pass
-    return "session/unknown"
+    return None
 
 
 def main():
@@ -74,18 +103,34 @@ def main():
         sys.exit(1)
 
     target = get_target()
+    if not target:
+        print("No active room and no --target specified.", file=sys.stderr)
+        sys.exit(1)
 
-    store = CommentStore(DB_PATH)
-    comment = store.create(
-        author="sameer",
-        target=target,
-        body=body,
-        quote=quote,
+    session_id = get_session_id()
+
+    payload = json.dumps({
+        "author": "sameer",
+        "body": body,
+        "quote": quote,
+        "session_id": session_id,
+    }).encode()
+
+    url = f"{_server_url()}/api/rooms/{target}/comments"
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    store.close()
-
-    print(f"Stored: {comment.id} on {target}")
-    print(f"Quote: {quote[:60]}{'...' if len(quote) > 60 else ''}")
+    try:
+        response = urllib.request.urlopen(req, timeout=5)
+        result = json.loads(response.read())
+        print(f"Posted: {result['id']} on {target}")
+        print(f"Quote: {quote[:60]}{'...' if len(quote) > 60 else ''}")
+    except urllib.error.URLError as e:
+        print(f"Failed to post: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
