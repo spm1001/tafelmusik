@@ -1,18 +1,31 @@
 {
   "name": "tafelmusik",
-  "version": "0.2.5",
-  "description": "Collaborative editing layer for Claude and Sameer — Yjs Y.Text + CodeMirror 6 + pycrdt",
+  "version": "0.2.6",
+  "description": "Collaborative editing layer for Claude and Sameer \u2014 Yjs Y.Text + CodeMirror 6 + pycrdt",
   "author": {
     "name": "Sameer Modha",
     "url": "https://github.com/spm1001"
   },
   "repository": "https://github.com/spm1001/tafelmusik",
   "license": "MIT",
-  "keywords": ["collaboration", "yjs", "crdt", "editing", "mcp"],
+  "keywords": [
+    "collaboration",
+    "yjs",
+    "crdt",
+    "editing",
+    "mcp"
+  ],
   "mcpServers": {
     "tafelmusik": {
       "command": "uv",
-      "args": ["run", "--directory", "${CLAUDE_PLUGIN_ROOT}", "python", "-m", "tafelmusik.mcp_server"],
+      "args": [
+        "run",
+        "--directory",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "python",
+        "-m",
+        "tafelmusik.mcp_server"
+      ],
       "env": {
         "TAFELMUSIK_URL": "ws://hezza:3456"
       }

@@ -2,9 +2,9 @@
 
 Auto-loaded via `~/.claude/rules/tafelmusik.md`.
 
-## Mandatory Skill Loading
+## Skill Loading
 
-**When `mcp__tafelmusik__` tools are available → invoke `Skill(collaborate)` before using them.**
+When `mcp__tafelmusik__` tools are available, invoke `Skill(collaborate)` before using them — it has the editing workflow context.
 
 ## Overrides
 
@@ -14,8 +14,8 @@ Auto-loaded via `~/.claude/rules/tafelmusik.md`.
 | `replace_section` for small fixes | `patch` mode — minimal blast radius, preserves authorship |
 | Edit without checking state | `inspect_doc` first if you haven't seen the doc recently |
 
-## Key Rules
+## Things Worth Knowing
 
 - **Load before editing.** `load_doc` connects to the room. Without it, edits go nowhere.
-- **Never `replace_section` on h1 headings.** It extends to EOF and destroys the document. Use `replace_all`.
+- **Avoid `replace_section` on h1 headings.** It extends to EOF and will replace the entire document from that heading down. Use `replace_all` instead.
 - **Flush at natural endpoints.** `flush_doc` commits text to disk. Comments (SQLite) survive flush — flush when the text is ready, not to clean up comments.
