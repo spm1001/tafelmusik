@@ -87,6 +87,8 @@ This means Claude can act from context (the comment quote + instruction is often
 
 ## Gotchas
 
+- **`sqlite3` `with` is NOT a resource manager.** `with sqlite3.connect(path) as conn:` only commits/rolls back — it does NOT close the connection. Always use `try/finally: conn.close()`. This caused a production outage: `_query_persisted_rooms` leaked one FD per `/api/rooms` call, exhausting the FD limit in ~10 minutes. Regression test: `test_api_rooms_does_not_leak_fds`.
+- **Logging:** Both processes use `tafelmusik.logging_config`. Stderr gets timestamped human output, JSONL call/event logs go to `~/.local/share/tafelmusik/` (`tools.jsonl` for MCP, `server.jsonl` for ASGI). Room name is the correlation key. Merge with `cat ~/.local/share/tafelmusik/*.jsonl | jq -s 'sort_by(.ts)[]'`. `configure_logging()` is called inside `create_app()` (ASGI) and `lifespan()` (MCP) — not at import time. Tests that import asgi_server without calling `create_app()` get no logging.
 - Neither the ASGI server nor the MCP server imports `pycrdt.websocket`. All sync protocol code uses public pycrdt APIs: `create_sync_message`, `handle_sync_message`, `create_update_message`, `doc.events()`.
 - `SQLiteYStore` is in `from pycrdt.store import SQLiteYStore`, NOT `pycrdt.websocket`.
 - SQLiteYStore does NOT auto-restore state. Use the two-instance pattern: transient store reads via `apply_updates()`, fresh store for ongoing writes. See `_restore_ydoc()` in `asgi_server.py`.

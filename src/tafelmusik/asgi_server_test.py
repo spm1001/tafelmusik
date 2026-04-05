@@ -1,6 +1,7 @@
 """Tests for ASGI server."""
 
 import asyncio
+from pathlib import Path
 
 import httpx
 import pytest
@@ -190,3 +191,34 @@ async def test_room_stays_with_remaining_clients(managed_server):
     # Both disconnected — room should be cleaned up
     await asyncio.sleep(0.5)
     assert room_name not in manager.rooms, "Room should be removed after last disconnect"
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").exists(),
+    reason="/proc/self/fd not available (Linux-only)",
+)
+async def test_api_rooms_does_not_leak_fds(server):
+    """Repeated /api/rooms calls must not leak SQLite connections.
+
+    Regression test: sqlite3's ``with conn:`` is a transaction manager,
+    not a resource manager — it does NOT close the connection. Without
+    explicit conn.close(), every /api/rooms call leaked one file descriptor
+    via _query_persisted_rooms, exhausting the FD limit in ~10 minutes.
+    """
+    import os
+    pid = os.getpid()
+
+    def count_fds():
+        return len(os.listdir(f"/proc/{pid}/fd"))
+
+    baseline = count_fds()
+
+    async with httpx.AsyncClient() as client:
+        for _ in range(50):
+            r = await client.get(f"http://127.0.0.1:{server}/api/rooms")
+            assert r.status_code == 200
+
+    # Allow a small margin (event loop internals), but 50 leaked FDs would be
+    # unmistakable. Before the fix, this leaked exactly 50.
+    leaked = count_fds() - baseline
+    assert leaked < 10, f"Leaked {leaked} FDs after 50 /api/rooms calls"

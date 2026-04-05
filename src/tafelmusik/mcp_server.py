@@ -47,6 +47,12 @@ from pycrdt import (
 )
 
 from tafelmusik import authors, comments, document
+from tafelmusik.logging_config import (
+    configure_call_logging,
+    configure_logging,
+    log_tool_call,
+    log_tool_exception,
+)
 
 log = logging.getLogger(__name__)
 
@@ -65,34 +71,40 @@ IDLE_TIMEOUT = 30.0
 
 
 # --- Tool logging helpers ---
-# Key=value format for greppability. Room name is the correlation key
-# between MCP server (stderr) and ASGI server (journalctl) logs.
+# Room name is the correlation key between MCP (tools.jsonl) and ASGI
+# (server.jsonl) logs. Both live in ~/.local/share/tafelmusik/.
 
 
 def _log_tool_entry(op: str, room: str = "?", **extras: object) -> float:
     """Log tool entry, return monotonic timestamp for duration."""
     parts = [f"op={op}", f"room={room}"]
     parts.extend(f"{k}={v}" for k, v in extras.items() if v is not None)
-    log.info("[tfm] %s", " ".join(parts))
+    log.info("%s", " ".join(parts))
     return time.monotonic()
 
 
 def _log_tool_result(
-    op: str, room: str, t0: float, result: str, *, error: bool = False
+    op: str, room: str, t0: float, result: str, *, error: bool = False,
 ) -> None:
-    """Log tool completion. Caller specifies error status explicitly."""
+    """Log tool completion to stderr + JSONL call log."""
     dur = (time.monotonic() - t0) * 1000
     level = logging.WARNING if error else logging.INFO
     preview = result[:100].replace("\n", " ")
-    log.log(level, "[tfm] op=%s room=%s dur=%.0fms status=%s %s",
+    log.log(level, "op=%s room=%s dur=%.0fms status=%s %s",
             op, room, dur, "error" if error else "ok", preview)
+    log_tool_call(
+        op, room, duration_ms=dur, ok=not error,
+        error=preview if error else None,
+        result_summary=preview if not error else None,
+    )
 
 
 def _log_tool_error(op: str, room: str, t0: float) -> None:
     """Log uncaught tool exception. Call from except block before re-raising."""
     dur = (time.monotonic() - t0) * 1000
-    log.warning("[tfm] op=%s room=%s dur=%.0fms status=error", op, room, dur,
+    log.warning("op=%s room=%s dur=%.0fms status=error", op, room, dur,
                 exc_info=True)
+    log_tool_exception(op, room, dur)
 
 
 _SIGNAL_PATH = Path(os.environ.get(
@@ -113,9 +125,9 @@ def _write_signal(room: str, event: dict, drift: int) -> None:
         })
         with _SIGNAL_PATH.open("a") as f:
             f.write(entry + "\n")
-        log.info("[tfm] signal written to %s", _SIGNAL_PATH)
+        log.info("signal written to %s", _SIGNAL_PATH)
     except Exception:
-        log.warning("[tfm] failed to write signal file", exc_info=True)
+        log.warning("failed to write signal file", exc_info=True)
 
 
 def _ws_to_http(url: str) -> str:
@@ -521,14 +533,14 @@ class AppState:
         if room in self.rooms:
             conn = self.rooms[room]
             if not conn.dead.is_set():
-                log.debug("[tfm] op=connect room=%s cached", room)
+                log.debug("op=connect room=%s cached", room)
                 return conn
             # Connection died — clean up before reconnecting
-            log.info("[tfm] op=connect room=%s reconnecting (previous died)", room)
+            log.info("op=connect room=%s reconnecting (previous died)", room)
             await conn.close()
             del self.rooms[room]
 
-        log.info("[tfm] op=connect room=%s", room)
+        log.info("op=connect room=%s", room)
         t0 = time.monotonic()
         # httpx-ws uses http:// for the WebSocket upgrade
         http_url = _ws_to_http(self.server_url)
@@ -583,19 +595,19 @@ class AppState:
             except (asyncio.CancelledError, Exception):
                 pass
             if failed_fast:
-                log.warning("[tfm] op=connect room=%s dur=%.0fms status=unreachable", room, dt)
+                log.warning("op=connect room=%s dur=%.0fms status=unreachable", room, dt)
                 raise ConnectionError(
                     f"Connection to room '{room}' failed. "
                     f"Is the Tafelmusik server running on {self.server_url}?"
                 )
-            log.warning("[tfm] op=connect room=%s dur=%.0fms status=timeout", room, dt)
+            log.warning("op=connect room=%s dur=%.0fms status=timeout", room, dt)
             raise TimeoutError(
                 f"Sync with Tafelmusik server timed out after {self.sync_timeout}s "
                 f"for room '{room}'. Is the server running and responding?"
             )
 
         dt = (time.monotonic() - t0) * 1000
-        log.info("[tfm] op=connect room=%s dur=%.0fms status=ok", room, dt)
+        log.info("op=connect room=%s dur=%.0fms status=ok", room, dt)
 
         conn = RoomConnection(
             doc=doc,
@@ -627,7 +639,7 @@ class AppState:
                     # Reset idle timer on each remote edit
                     if conn._idle_timer is not None:
                         conn._idle_timer.cancel()
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     conn._idle_timer = loop.call_later(
                         self.idle_timeout,
                         lambda: asyncio.ensure_future(_push_resync(conn, room)),
@@ -761,11 +773,39 @@ def _find_git_root(path: Path) -> Path | None:
     return None
 
 
+def _git_commit_flush(docs_dir: Path, md_path: Path, room: str) -> str:
+    """Git add + commit for flush_doc. Synchronous — call via asyncio.to_thread."""
+    repo_root = _find_git_root(docs_dir)
+    if not repo_root:
+        return " No git repo found — skipped commit."
+    git_msg = f"flush: {room}"
+    try:
+        subprocess.run(
+            ["git", "add", str(md_path)],
+            cwd=str(repo_root), check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", git_msg, "--", str(md_path)],
+            cwd=str(repo_root), check=True, capture_output=True,
+        )
+        return " Git committed."
+    except subprocess.CalledProcessError as e:
+        if e.returncode == 1:
+            return " Git commit skipped (no changes)."
+        stderr_msg = e.stderr.decode().strip() if e.stderr else f"exit {e.returncode}"
+        log.warning("op=flush_doc room=%s git_error: %s", room, stderr_msg)
+        return f" Git commit failed (exit {e.returncode})."
+
+
 # --- FastMCP setup ---
 
 
 @asynccontextmanager
 async def lifespan(app: FastMCP) -> AsyncIterator[AppState]:
+    configure_logging()
+    call_log = configure_call_logging()
+    if call_log:
+        log.info("JSONL call log: %s", call_log)
     server_url = os.environ.get("TAFELMUSIK_URL", "ws://127.0.0.1:3456")
     async with httpx.AsyncClient() as client:
         state = AppState(client=client, server_url=server_url)
@@ -1084,35 +1124,10 @@ async def flush_doc(room: str, ctx: Context) -> str:
         comments_map: Map = conn.doc.get("comments", type=Map)
         wiped = comments.clear_all(conn.doc, comments_map, author=authors.CLAUDE)
 
-        # Git commit the file (only if docs_dir is inside a git repo)
-        git_status = ""
-        repo_root = _find_git_root(docs_dir)
-        if repo_root:
-            git_msg = f"flush: {room}"
-            try:
-                subprocess.run(
-                    ["git", "add", str(md_path)],
-                    cwd=str(repo_root),
-                    check=True,
-                    capture_output=True,
-                )
-                subprocess.run(
-                    ["git", "commit", "-m", git_msg, "--", str(md_path)],
-                    cwd=str(repo_root),
-                    check=True,
-                    capture_output=True,
-                )
-                git_status = " Git committed."
-            except subprocess.CalledProcessError as e:
-                if e.returncode == 1:
-                    # git commit returns 1 for "nothing to commit" — expected
-                    git_status = " Git commit skipped (no changes)."
-                else:
-                    stderr_msg = e.stderr.decode().strip() if e.stderr else f"exit {e.returncode}"
-                    log.warning("[tfm] op=flush_doc room=%s git_error: %s", room, stderr_msg)
-                    git_status = f" Git commit failed (exit {e.returncode})."
-        else:
-            git_status = " No git repo found — skipped commit."
+        # Git commit — runs in a thread to avoid blocking the event loop.
+        git_status = await asyncio.to_thread(
+            _git_commit_flush, docs_dir, md_path, room
+        )
 
         comment_note = f" {wiped} comment(s) cleared." if wiped else ""
         msg = f"Flushed {len(content)} chars to {md_path}.{comment_note}{git_status}"

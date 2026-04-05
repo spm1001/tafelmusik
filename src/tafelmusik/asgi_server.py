@@ -28,13 +28,12 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from tafelmusik.logging_config import configure_event_logging, configure_logging, log_event
+
 PORT = 3456
 ROOT = Path(__file__).resolve().parent.parent.parent
 HOME = Path.home()
 
-# Uvicorn configures its own loggers but not root. basicConfig adds a
-# root handler so our lifecycle logs reach stderr (and journalctl).
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s")
 log = logging.getLogger(__name__)
 
 
@@ -81,8 +80,10 @@ async def _restore_ydoc(store_cls: type[SQLiteYStore], path: str) -> Doc:
         try:
             await store.apply_updates(doc)
             log.info("Room %s: restored from store", path)
+            log_event("room_restored", path)
         except YDocNotFound:
             log.info("Room %s: created (no prior content)", path)
+            log_event("room_created", path)
     return doc
 
 
@@ -173,6 +174,7 @@ class Room:
         """
         self.channels.add(channel)
         log.info("Room %s: client connected (%d total)", self.name, len(self.channels))
+        log_event("client_connected", self.name, clients=len(self.channels))
         try:
             await channel.send(create_sync_message(self.doc))
             async for message in channel:
@@ -183,6 +185,7 @@ class Room:
         finally:
             self.channels.discard(channel)
             log.info("Room %s: client disconnected (%d remaining)", self.name, len(self.channels))
+            log_event("client_disconnected", self.name, clients=len(self.channels))
 
 
 class RoomManager:
@@ -217,6 +220,7 @@ class RoomManager:
                     with doc.transaction():
                         text += content
                 log.info("Room %s: hydrated from %s", name, md_path)
+                log_event("room_hydrated", name, source=str(md_path), chars=len(content))
             else:
                 doc = await _restore_ydoc(self._store_cls, name)
 
@@ -239,10 +243,12 @@ class RoomManager:
             md_path = self._safe_doc_path(name)
             if md_path is not None and md_path.exists():
                 log.info("Room %s: last client left, keeping (file-backed)", name)
+                log_event("room_retained", name, reason="file-backed")
                 return
             del self.rooms[name]
             await room.stop()
             log.info("Room %s: cleaned up (no clients)", name)
+            log_event("room_evicted", name)
 
     async def close(self) -> None:
         """Stop all rooms."""
@@ -260,6 +266,10 @@ def create_app(
     docs_dir: str | Path | None = None,
 ) -> Starlette:
     """Create the ASGI application with the given configuration."""
+    configure_logging()
+    event_log = configure_event_logging()
+    if event_log:
+        log.info("JSONL event log: %s", event_log)
 
     _db_path = str(db_path)
     _docs_dir = Path(docs_dir) if docs_dir else Path(
@@ -290,13 +300,24 @@ def create_app(
         await manager.remove_if_empty(room_name)
 
     def _query_persisted_rooms() -> set[str]:
-        """Query SQLite for room names (runs in a thread to avoid blocking)."""
+        """Query SQLite for room names (runs in a thread to avoid blocking).
+
+        Note: sqlite3's ``with conn:`` is a *transaction* manager (commit/rollback),
+        NOT a resource manager — it does NOT close the connection. We must call
+        conn.close() explicitly, otherwise every /api/rooms request leaks a
+        file descriptor. This was the root cause of the server hanging after
+        ~10 minutes (FD limit exhausted).
+        """
+        conn = None
         try:
-            with sqlite3.connect(_db_path) as conn:
-                return {row[0] for row in conn.execute("SELECT DISTINCT path FROM yupdates")}
+            conn = sqlite3.connect(_db_path)
+            return {row[0] for row in conn.execute("SELECT DISTINCT path FROM yupdates")}
         except Exception:
             log.warning("Failed to query persisted rooms from %s", _db_path, exc_info=True)
             return set()
+        finally:
+            if conn is not None:
+                conn.close()
 
     # Directories skipped when scanning docs_dir for .md files.
     # Dotdirs (.bon, .claude, .git), dependency dirs, and build artifacts

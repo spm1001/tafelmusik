@@ -30,9 +30,13 @@ The .md file is truth, the CRDT is the collaboration overlay. `docs_dir` paramet
 
 **The CRDT duplication trap:** Every file hydration creates NEW CRDT operations (new client ID, new clocks). Any peer holding old operations will merge both sets — producing duplicated content. Room retention (keeping file-backed rooms in memory) prevents duplication on idle reconnects. The browser-side fix (tfm-wiseha) is: detect server restart and discard the stale local Y.Doc before reconnecting.
 
-## Notification delivery gap
+## Channel notifications — solved
 
-The MCP server's notification pipeline is correct — observer fires, debouncer runs, `send_message()` writes to stdio without error. The break is on the CC side: channel notifications are silently dropped in most REPL states. This is a known CC bug (anthropics/claude-code#36975, #37139, #40237, #36477). Two working push paths into Claude's context exist: (1) mousetrap pattern (background Bash exit → `<task-notification>`), (2) asyncRewake hooks (exit code 2 → `enqueuePendingNotification`). The signal file approach is the current workaround.
+The notification pipeline works end-to-end: MCP observer → debouncer → `send_message()` → CC context. The weeks-long "silently dropped" mystery was a one-line fix: channel notification `meta` values must be strings (`z.record(z.string(), z.string())` Zod validation in CC). Sending `"drift": 466` (int) silently failed Zod validation — cast to `str(drift)` and notifications arrived immediately. Not a CC bug, not timing, not idle-state — just a type mismatch. (Prior investigation tracked as CC issues: anthropics/claude-code#36975, #37139, #40237, #36477 — keep these references if notification behaviour changes in a future CC version.)
+
+Cross-machine MCP validated end-to-end: plugin on Mac connects to hezza:3456 over Tailscale. Channel flag on Mac is `plugin:tafelmusik@batterie-de-savoir` (not `server:tafelmusik`). Both initial pushes and comment notifications delivered across machines.
+
+CC session ID available at `~/.claude/sessions/{PID}.json` (sessionId UUID, cwd, startedAt) — enables routing tmux comments to the correct Claude session.
 
 ## Key technical constraints
 
@@ -43,6 +47,7 @@ The MCP server's notification pipeline is correct — observer fires, debouncer 
 - y-websocket's hardcoded 30s `messageReconnectTimeout` kills quiet connections — monkey-patched, proper fix is standalone browser sync (tfm-salima).
 - `text[start:end] = new_content` strips formatting attrs — use `del` + `insert` to preserve authorship.
 - `replace_section` refuses h1 headings (extends to EOF) — use `replace_all` instead.
+- `/api/rooms` file scan cached with 30s TTL — previously did synchronous rglob across ~/Repos (851+ files) on every request, blocking the async event loop.
 
 ## Working patterns
 
