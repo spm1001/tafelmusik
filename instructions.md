@@ -18,4 +18,4 @@ Auto-loaded via `~/.claude/rules/tafelmusik.md`.
 
 - **Load before editing.** `load_doc` connects to the room. Without it, edits go nowhere.
 - **Never `replace_section` on h1 headings.** It extends to EOF and destroys the document. Use `replace_all`.
-- **Flush at natural endpoints.** `flush_doc` wipes comments — don't flush mid-conversation.
+- **Flush at natural endpoints.** `flush_doc` commits text to disk. Comments (SQLite) survive flush — flush when the text is ready, not to clean up comments.

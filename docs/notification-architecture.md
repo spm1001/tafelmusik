@@ -82,11 +82,9 @@ From CC source analysis (`~/Repos/claude-code/src/`):
 
 ## Recommended approach (current)
 
-**First notification:** asyncRewake SessionStart hook catches it for free.
+**Channel notifications** (option #1) are now the production path. The meta-values-must-be-strings bug was the root cause of "silently dropped" — fixed 2026-04-03. All comments flow: HTTP POST → ASGI 0x01 broadcast → MCP `_handle_comment_event` → `_comment_consumer` → `notifications/claude/channel`. Requires `--dangerously-load-development-channels` flag.
 
-**Subsequent notifications:** Background task watcher (mousetrap), restarted by Claude after each catch.
-
-**Future:** Replace y-websocket with standalone code, implement proper awareness echo or server-side keepalive, potentially adopt CC's swarm messaging when it ships publicly.
+The signal file, asyncRewake, and mousetrap approaches above are **historical** — they were explored before channel notifications worked end-to-end. The signal file code has been removed from the codebase (tfm-lupoja, 2026-04-05).
 
 ## Related
 

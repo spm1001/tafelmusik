@@ -6,7 +6,7 @@ Two processes, one codebase: ASGI server (always-running, holds Y.Doc) and MCP s
 
 ## The architectural rethink (2026-04-01)
 
-The accumulated brittleness of the stack — y-websocket monkey-patched, pycrdt-store squashing disabled, signal files as notification workaround, drift tracking for a problem that shouldn't exist — prompted a full reassessment. The conclusion: Tafelmusik is not a document editor with annotations. It's a **messaging layer with one novel property: content-addressed anchoring into shared artifacts.**
+The accumulated brittleness of the stack — y-websocket monkey-patched, pycrdt-store squashing disabled, drift tracking for a problem that shouldn't exist — prompted a full reassessment. The conclusion: Tafelmusik is not a document editor with annotations. It's a **messaging layer with one novel property: content-addressed anchoring into shared artifacts.**
 
 ### Comments are messages, not annotations
 
@@ -28,7 +28,7 @@ Deep Research found that CM6's OT collab doesn't guarantee position convergence 
 
 All three surfaces — MCP tools, browser, tmux — now use HTTP/SQLite for comments. MCP tools use HTTP endpoints on the ASGI server. Browser fetches/creates/resolves via HTTP, receives real-time updates via 0x01 WebSocket broadcasts (intercepted before y-websocket can misparse them as awareness). Re-anchoring is lazy — computed on read via server-side 4-strategy cascade, not maintained on write. The browser debounce-refetches on doc changes (500ms) for updated anchor positions.
 
-**Dead Y.Map code remaining:** `comments.py` module, Y.Map observer in `mcp_server.py`, `flush_doc`'s `clear_all` call on an empty Y.Map. All deletable after tfm-kokudo. `flush_doc` still clears Y.Map (no-op) but does not touch SQLite comments — SQLite comments survive flush by design.
+Y.Map comment code fully removed (tfm-kokudo, 2026-04-05). `comments.py` module deleted, Y.Map observer removed from MCP server, `flush_doc` no longer touches comments. Signal file notification path also removed (tfm-lupoja) — comments flow HTTP → 0x01 broadcast → MCP `_handle_comment_event` → channel notification, no intermediate files.
 
 ## The files-on-disk pivot (calute)
 
@@ -64,3 +64,5 @@ CC session ID available at `~/.claude/sessions/{PID}.json` (sessionId UUID, cwd,
 - **System observables before instrumentation:** When a server misbehaves, start with what the kernel already knows (`/proc/PID/fd`, `lsof`, `ss`, `ps aux`) before building logging or metrics. The telemetry is already there — read it first.
 - **Context managers lie about cleanup:** Python's `with sqlite3.connect(path) as conn:` commits/rolls back but does NOT close the connection. This caused a production outage (one leaked FD per `/api/rooms` call, FD limit hit in ~10 minutes). Broader lesson: for any database library, check what `__exit__` actually does — don't assume resource cleanup. Always `try/finally: conn.close()`.
 - **Migrations have a documentation surface area.** When migrating an intermediate layer (e.g. Y.Map → HTTP/SQLite), the code change is the easy part. CLAUDE.md, understanding.md, bon briefs, test docstrings, tool descriptions, module docstrings, and skill instructions all encode assumptions about which system is active. Every surface a future Claude reads becomes a potential source of wrong assumptions. Budget explicitly for documentation sweep — it's part of the migration, not cleanup after it.
+- **Contain, document, track elimination.** When intercepting a library's internal handling (wrapping `onmessage`, monkey-patching dispatchers, hooking protocol layers), you're betting on implementation details, not contracts. The sustainable pattern: contain the interception, document the assumption explicitly as a gotcha, and track the work that eliminates the dependency. Every interception should carry its own expiry date. The unsustainable pattern: intercept, ship, forget.
+- **Simplification that loses intention is entropy.** When replacing targeted code (e.g. rebuild called from exactly two places) with "simpler" code (rebuild on every update), first articulate why the original had that constraint. If you can't explain the reason, you haven't understood it well enough to remove it.

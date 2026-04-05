@@ -44,10 +44,26 @@ def get_tmux_buffer() -> str | None:
 
 
 def get_session_id() -> str | None:
-    """Get CC session ID from the most recent session file."""
+    """Get CC session ID for the Claude running in the current tmux pane.
+
+    Walks: tmux pane_pid → shell PID → Claude child PID → session file.
+    Falls back to most recent session file if not in tmux.
+    """
     session_dir = os.path.expanduser("~/.claude/sessions")
     if not os.path.isdir(session_dir):
         return None
+
+    # Try pane-aware lookup first
+    claude_pid = _find_claude_pid_in_pane()
+    if claude_pid:
+        session_file = os.path.join(session_dir, f"{claude_pid}.json")
+        try:
+            with open(session_file) as f:
+                return json.load(f).get("sessionId")
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    # Fallback: most recent session file
     try:
         files = [
             os.path.join(session_dir, f)
@@ -56,13 +72,36 @@ def get_session_id() -> str | None:
         ]
         if not files:
             return None
-        # Most recent session file
         latest = max(files, key=os.path.getmtime)
         with open(latest) as f:
-            data = json.load(f)
-        return data.get("sessionId")
+            return json.load(f).get("sessionId")
     except Exception:
         return None
+
+
+def _find_claude_pid_in_pane() -> str | None:
+    """Find the Claude process PID in the active tmux pane."""
+    try:
+        # Get the shell PID of the active pane
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#{pane_pid}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode != 0:
+            return None
+        pane_pid = result.stdout.strip()
+
+        # Find claude child of that shell
+        result = subprocess.run(
+            ["pgrep", "-P", pane_pid, "-a"],
+            capture_output=True, text=True, timeout=2,
+        )
+        for line in result.stdout.splitlines():
+            if "claude" in line and "grep" not in line:
+                return line.split()[0]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 def get_target() -> str | None:
