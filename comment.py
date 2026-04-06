@@ -104,11 +104,19 @@ def _find_claude_pid_in_pane() -> str | None:
     return None
 
 
+def _get_arg(flag: str) -> str | None:
+    """Get a named argument value from sys.argv."""
+    for i, arg in enumerate(sys.argv):
+        if arg == flag and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
 def get_target() -> str | None:
     """Get room name from --target arg or auto-discover active room."""
-    for i, arg in enumerate(sys.argv):
-        if arg == "--target" and i + 1 < len(sys.argv):
-            return sys.argv[i + 1]
+    explicit = _get_arg("--target")
+    if explicit:
+        return explicit
     # Auto-discover: query server for active rooms
     try:
         url = f"{_server_url()}/api/rooms"
@@ -141,7 +149,7 @@ def main():
         print("Empty comment, skipping.", file=sys.stderr)
         sys.exit(1)
 
-    session_id = get_session_id()
+    session_id = _get_arg("--session-id") or get_session_id()
     target = get_target()
     base_url = _server_url()
 
