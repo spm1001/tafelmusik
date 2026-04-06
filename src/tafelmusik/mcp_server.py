@@ -941,21 +941,40 @@ async def lifespan(app: FastMCP) -> AsyncIterator[AppState]:
     async with httpx.AsyncClient() as client:
         state = AppState(client=client, server_url=server_url)
         await state.start_room_poller()
-        session_id = _get_cc_session_id()
-        if session_id:
-            await state.start_session_ws(session_id)
-            log.info("Session-direct WebSocket started (session %s)", session_id)
-        else:
-            log.info("No CC session ID found — session-direct comments disabled")
+
+        async def _deferred_session_ws():
+            """Wait for MCP session capture, then start session WebSocket.
+
+            CC rewrites the session file during startup (temporary ID →
+            final resumed ID). Reading too early picks up the temporary.
+            Waiting for session_ready ensures CC has settled.
+            """
+            try:
+                await asyncio.wait_for(
+                    state.session_ready.wait(), timeout=state.session_timeout,
+                )
+            except TimeoutError:
+                log.info("Session-direct WebSocket: no MCP session, skipping")
+                return
+            session_id = _get_cc_session_id()
+            if session_id:
+                await state.start_session_ws(session_id)
+                log.info("Session-direct WebSocket started (session %s)", session_id)
+            else:
+                log.info("No CC session ID found — session-direct comments disabled")
+
+        session_ws_init = asyncio.create_task(_deferred_session_ws())
         watchdog = asyncio.create_task(_parent_watchdog())
         try:
             yield state
         finally:
+            session_ws_init.cancel()
             watchdog.cancel()
-            try:
-                await watchdog
-            except asyncio.CancelledError:
-                pass
+            for t in (session_ws_init, watchdog):
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
             await state.close_all()
 
 
