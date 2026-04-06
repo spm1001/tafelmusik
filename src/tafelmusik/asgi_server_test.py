@@ -226,20 +226,8 @@ async def test_api_rooms_does_not_leak_fds(server):
     assert leaked < 10, f"Leaked {leaked} FDs after 50 /api/rooms calls"
 
 
-async def test_session_registry_lifecycle(managed_server):
-    """Session ID is tracked in registry on connect, removed on disconnect."""
-    port, manager = managed_server
-    sid = "test-session-abc123"
-
-    async with connect_peer(port, "session-test", session_id=sid):
-        assert sid in manager.session_registry
-    # After disconnect
-    await asyncio.sleep(0.5)
-    assert sid not in manager.session_registry
-
-
-async def test_session_registry_no_session_id(managed_server):
-    """Connections without session_id don't pollute the registry."""
+async def test_room_connections_dont_register_sessions(managed_server):
+    """Room WebSocket connections don't touch the session registry."""
     port, manager = managed_server
 
     async with connect_peer(port, "no-session-test"):
@@ -251,17 +239,21 @@ async def test_session_comment_delivered(managed_server):
     port, manager = managed_server
     sid = "comment-target-session"
 
-    async with connect_peer(port, "session-room", session_id=sid):
-        async with httpx.AsyncClient() as client:
-            r = await client.post(
-                f"http://127.0.0.1:{port}/api/sessions/{sid}/comments",
-                json={"author": "sameer", "body": "hey Claude, look at this"},
-            )
-        assert r.status_code == 201
-        data = r.json()
-        assert data["target"] == f"session:{sid}"
-        assert data["body"] == "hey Claude, look at this"
-        assert data["author"] == "sameer"
+    async with httpx.AsyncClient() as ws_client:
+        async with aconnect_ws(
+            f"http://127.0.0.1:{port}/_ws/_session/{sid}", ws_client,
+        ):
+            await asyncio.sleep(0.3)
+            async with httpx.AsyncClient() as post_client:
+                r = await post_client.post(
+                    f"http://127.0.0.1:{port}/api/sessions/{sid}/comments",
+                    json={"author": "sameer", "body": "hey Claude, look at this"},
+                )
+            assert r.status_code == 201
+            data = r.json()
+            assert data["target"] == f"session:{sid}"
+            assert data["body"] == "hey Claude, look at this"
+            assert data["author"] == "sameer"
 
 
 async def test_session_comment_404_when_not_connected(managed_server):
@@ -281,19 +273,22 @@ async def test_session_comment_not_broadcast_to_room(managed_server):
     port, manager = managed_server
     sid = "isolated-session"
 
-    # Connect session peer and a plain room peer to the same room
-    async with connect_peer(port, "shared-room", session_id=sid):
-        async with connect_peer(port, "shared-room") as room_text:
-            async with httpx.AsyncClient() as client:
-                r = await client.post(
-                    f"http://127.0.0.1:{port}/api/sessions/{sid}/comments",
-                    json={"author": "sameer", "body": "session-only msg"},
-                )
-            assert r.status_code == 201
-            # Room peer's CRDT text should not contain the comment
-            # (session comments go via 0x01 to the WebSocket, not via CRDT)
+    # Connect a dedicated session WebSocket and a room peer
+    async with httpx.AsyncClient() as ws_client:
+        async with aconnect_ws(
+            f"http://127.0.0.1:{port}/_ws/_session/{sid}", ws_client,
+        ):
             await asyncio.sleep(0.3)
-            assert "session-only msg" not in str(room_text)
+            async with connect_peer(port, "shared-room") as room_text:
+                async with httpx.AsyncClient() as post_client:
+                    r = await post_client.post(
+                        f"http://127.0.0.1:{port}/api/sessions/{sid}/comments",
+                        json={"author": "sameer", "body": "session-only msg"},
+                    )
+                assert r.status_code == 201
+                # Room peer's CRDT text should not contain the comment
+                await asyncio.sleep(0.3)
+                assert "session-only msg" not in str(room_text)
 
 
 async def test_dedicated_session_websocket(managed_server):

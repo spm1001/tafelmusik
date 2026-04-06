@@ -327,21 +327,12 @@ def create_app(
 
     async def websocket_endpoint(websocket: WebSocket):
         room_name = websocket.path_params.get("room", "default")
-        session_id = websocket.query_params.get("session_id")
         await websocket.accept()
-        if session_id:
-            manager.session_registry[session_id] = websocket
-            log.info("Session %s registered (room %s)", session_id, room_name)
-            log_event("session_registered", room_name, session_id=session_id)
         channel = StarletteWebsocket(websocket)
         room = await manager.get_room(room_name)
         try:
             await room.serve(channel)
         finally:
-            if session_id and manager.session_registry.get(session_id) is websocket:
-                del manager.session_registry[session_id]
-                log.info("Session %s unregistered", session_id)
-                log_event("session_unregistered", room_name, session_id=session_id)
             await manager.remove_if_empty(room_name)
 
     async def session_websocket(websocket: WebSocket):
