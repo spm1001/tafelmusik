@@ -42,7 +42,7 @@ fi
 
 # 3. Check ASGI server
 if curl -sf --max-time 2 "$URL" >/dev/null 2>&1; then
-    echo '{"hookSpecificOutput": "Tafelmusik server running on :'"$PORT"'"}'
+    echo '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "Tafelmusik server running on :'"$PORT"'"}}'
     exit 0
 fi
 
@@ -65,7 +65,7 @@ fi
 # Wait for server
 for i in 1 2 3 4 5; do
     if curl -sf --max-time 1 "$URL" >/dev/null 2>&1; then
-        echo '{"hookSpecificOutput": "Tafelmusik server started on :'"$PORT"'"}'
+        echo '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "Tafelmusik server started on :'"$PORT"'"}}'
         exit 0
     fi
     sleep 1
