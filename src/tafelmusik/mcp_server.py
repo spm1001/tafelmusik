@@ -943,11 +943,12 @@ async def lifespan(app: FastMCP) -> AsyncIterator[AppState]:
         await state.start_room_poller()
 
         async def _deferred_session_ws():
-            """Wait for MCP session capture, then start session WebSocket.
+            """Wait for session file to stabilize, then start session WebSocket.
 
             CC rewrites the session file during startup (temporary ID →
-            final resumed ID). Reading too early picks up the temporary.
-            Waiting for session_ready ensures CC has settled.
+            final resumed ID). The MCP handshake completes before CC
+            finishes its own initialization. Poll the file until the
+            session ID stops changing.
             """
             try:
                 await asyncio.wait_for(
@@ -956,7 +957,15 @@ async def lifespan(app: FastMCP) -> AsyncIterator[AppState]:
             except TimeoutError:
                 log.info("Session-direct WebSocket: no MCP session, skipping")
                 return
-            session_id = _get_cc_session_id()
+            # Poll for stability — CC rewrites the file during init
+            prev = None
+            for _ in range(5):
+                await asyncio.sleep(2)
+                current = _get_cc_session_id()
+                if current and current == prev:
+                    break
+                prev = current
+            session_id = prev
             if session_id:
                 await state.start_session_ws(session_id)
                 log.info("Session-direct WebSocket started (session %s)", session_id)
