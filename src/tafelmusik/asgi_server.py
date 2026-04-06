@@ -203,6 +203,7 @@ class RoomManager:
         self._store_cls = store_cls
         self._docs_dir = docs_dir
         self.rooms: dict[str, Room] = {}
+        self.session_registry: dict[str, WebSocket] = {}
 
     def _safe_doc_path(self, name: str) -> Path | None:
         """Resolve a room name to a .md path, rejecting traversal attempts."""
@@ -326,11 +327,46 @@ def create_app(
 
     async def websocket_endpoint(websocket: WebSocket):
         room_name = websocket.path_params.get("room", "default")
+        session_id = websocket.query_params.get("session_id")
         await websocket.accept()
+        if session_id:
+            manager.session_registry[session_id] = websocket
+            log.info("Session %s registered (room %s)", session_id, room_name)
+            log_event("session_registered", room_name, session_id=session_id)
         channel = StarletteWebsocket(websocket)
         room = await manager.get_room(room_name)
-        await room.serve(channel)
-        await manager.remove_if_empty(room_name)
+        try:
+            await room.serve(channel)
+        finally:
+            if session_id and manager.session_registry.get(session_id) is websocket:
+                del manager.session_registry[session_id]
+                log.info("Session %s unregistered", session_id)
+                log_event("session_unregistered", room_name, session_id=session_id)
+            await manager.remove_if_empty(room_name)
+
+    async def session_websocket(websocket: WebSocket):
+        """Dedicated WebSocket for session-direct comment delivery.
+
+        No CRDT sync, no room — just a persistent pipe registered in
+        session_registry so session_comment() can push 0x01 events.
+        """
+        session_id = websocket.path_params["session_id"]
+        await websocket.accept()
+        manager.session_registry[session_id] = websocket
+        log.info("Session %s: dedicated WebSocket connected", session_id)
+        log_event("session_connected", session_id=session_id)
+        try:
+            # Hold connection open until client disconnects.
+            # The only traffic is outbound 0x01 from session_comment().
+            while True:
+                await websocket.receive_bytes()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            if manager.session_registry.get(session_id) is websocket:
+                del manager.session_registry[session_id]
+            log.info("Session %s: dedicated WebSocket disconnected", session_id)
+            log_event("session_disconnected", session_id=session_id)
 
     def _query_persisted_rooms() -> set[str]:
         """Query SQLite for room names (runs in a thread to avoid blocking).
@@ -495,6 +531,43 @@ def create_app(
         log_event("comment_resolved", room_name, comment_id=comment_id)
         return JSONResponse(_comment_dict(comment))
 
+    async def session_comment(request):
+        """Post a comment to a specific Claude session, not a room."""
+        session_id = request.path_params["session_id"]
+        ws = manager.session_registry.get(session_id)
+        if ws is None:
+            return JSONResponse(
+                {"error": "session not connected"}, status_code=404,
+            )
+
+        data = await request.json()
+        for required in ("author", "body"):
+            if required not in data:
+                return JSONResponse(
+                    {"error": f"missing required field: {required}"},
+                    status_code=400,
+                )
+
+        comment = comment_store.create(
+            author=data["author"],
+            target=f"session:{session_id}",
+            body=data["body"],
+            quote=data.get("quote"),
+            prefix=data.get("prefix"),
+            suffix=data.get("suffix"),
+            replies_to=data.get("replies_to"),
+        )
+
+        event = _comment_event("comment_created", comment)
+        try:
+            await ws.send_bytes(event)
+        except (WebSocketDisconnect, RuntimeError):
+            manager.session_registry.pop(session_id, None)
+            log.warning("Session %s: send failed, removed from registry", session_id)
+
+        log_event("session_comment", session_id, author=data["author"], comment_id=comment.id)
+        return JSONResponse(_comment_dict(comment), status_code=201)
+
     @asynccontextmanager
     async def lifespan(app):
         try:
@@ -512,12 +585,14 @@ def create_app(
     app = Starlette(
         lifespan=lifespan,
         routes=[
+            Route("/api/sessions/{session_id}/comments", session_comment, methods=["POST"]),
             Route("/api/rooms", list_rooms),
             Route(
                 "/api/rooms/{room:path}/comments/{comment_id}/resolve",
                 resolve_comment, methods=["POST"],
             ),
             Route("/api/rooms/{room:path}/comments", handle_comments, methods=["GET", "POST"]),
+            WebSocketRoute("/_ws/_session/{session_id}", session_websocket),
             WebSocketRoute("/_ws/{room:path}", websocket_endpoint),
             Mount("/static", StaticFiles(directory=_public_dir)),
             Route("/{path:path}", spa_fallback),

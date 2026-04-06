@@ -141,35 +141,51 @@ def main():
         print("Empty comment, skipping.", file=sys.stderr)
         sys.exit(1)
 
-    target = get_target()
-    if not target:
-        print("No active room and no --target specified.", file=sys.stderr)
-        sys.exit(1)
-
     session_id = get_session_id()
+    target = get_target()
+    base_url = _server_url()
 
-    payload = json.dumps({
+    comment_payload = json.dumps({
         "author": "sameer",
         "body": body,
         "quote": quote,
-        "session_id": session_id,
     }).encode()
 
-    url = f"{_server_url()}/api/rooms/{target}/comments"
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        response = urllib.request.urlopen(req, timeout=5)
-        result = json.loads(response.read())
-        print(f"Posted: {result['id']} on {target}")
-        print(f"Quote: {quote[:60]}{'...' if len(quote) > 60 else ''}")
-    except urllib.error.URLError as e:
-        print(f"Failed to post: {e}", file=sys.stderr)
-        sys.exit(1)
+    headers = {"Content-Type": "application/json"}
+    routed_via = None
+
+    # Try session-direct first (reaches specific Claude in this pane)
+    if session_id:
+        url = f"{base_url}/api/sessions/{session_id}/comments"
+        req = urllib.request.Request(url, data=comment_payload, headers=headers, method="POST")
+        try:
+            response = urllib.request.urlopen(req, timeout=5)
+            result = json.loads(response.read())
+            routed_via = "session"
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                print(f"Failed to post: {e}", file=sys.stderr)
+                sys.exit(1)
+            # 404 = session not connected, fall through to room
+
+    # Fall back to room endpoint (broadcast to all peers in room)
+    if routed_via is None:
+        if not target:
+            print("No session connected and no active room found.", file=sys.stderr)
+            sys.exit(1)
+        url = f"{base_url}/api/rooms/{target}/comments"
+        req = urllib.request.Request(url, data=comment_payload, headers=headers, method="POST")
+        try:
+            response = urllib.request.urlopen(req, timeout=5)
+            result = json.loads(response.read())
+            routed_via = "room"
+        except urllib.error.URLError as e:
+            print(f"Failed to post: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    route_label = f"→ session" if routed_via == "session" else f"→ room:{target}"
+    print(f"Posted: {result['id']} {route_label}")
+    print(f"Quote: {quote[:60]}{'...' if len(quote) > 60 else ''}")
 
 
 if __name__ == "__main__":

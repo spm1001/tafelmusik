@@ -462,6 +462,48 @@ class RoomConnection:
             pass
 
 
+async def _session_comment_consumer(
+    queue: asyncio.Queue,
+    get_session,
+    session_ready: asyncio.Event,
+    session_timeout: float = 30.0,
+) -> None:
+    """Consume session-direct comments and send channel notifications.
+
+    Simpler than _comment_consumer: no drift tracking, no document content.
+    Session comments are tmux reactions to Claude's terminal output —
+    they carry their own context in the quote/body.
+    """
+    while True:
+        event = await queue.get()
+        if get_session() is None:
+            try:
+                await asyncio.wait_for(session_ready.wait(), timeout=session_timeout)
+            except TimeoutError:
+                log.warning("Session comment dropped — no MCP session after %.0fs", session_timeout)
+                continue
+
+        comment_text = (
+            f"Session comment by {event['author']}:\n"
+            f"> \"{event['quote']}\"\n"
+            f"{event['body']}"
+        ) if event.get("quote") else (
+            f"Session comment by {event['author']}:\n"
+            f"{event['body']}"
+        )
+        try:
+            await _send_channel_notification(
+                get_session(),
+                comment_text,
+                meta={
+                    "type": "session_comment",
+                    "comment_id": event.get("comment_id", ""),
+                },
+            )
+        except Exception:
+            log.warning("Failed to send session comment notification", exc_info=True)
+
+
 @dataclass
 class AppState:
     """Shared state for the MCP server's lifetime.
@@ -484,6 +526,9 @@ class AppState:
 
     def __post_init__(self) -> None:
         self._session: ServerSession | None = None
+        self._session_ws_task: asyncio.Task | None = None
+        self._session_comment_queue: asyncio.Queue = asyncio.Queue()
+        self._session_consumer_task: asyncio.Task | None = None
 
     @property
     def session(self) -> ServerSession | None:
@@ -706,7 +751,64 @@ class AppState:
                 log.debug("Room poller: server unreachable, will retry")
             await asyncio.sleep(self._poll_interval)
 
+    async def start_session_ws(self, session_id: str) -> None:
+        """Open a dedicated WebSocket for session-direct comment delivery.
+
+        Connects to /_ws/_session/{session_id} on the ASGI server. Reads
+        0x01 messages and feeds them into _session_comment_queue. A
+        separate consumer task sends channel notifications.
+        """
+        http_url = _ws_to_http(self.server_url)
+
+        async def _session_ws_loop():
+            while True:
+                try:
+                    async with aconnect_ws(
+                        f"{http_url}/_ws/_session/{session_id}", self.client,
+                    ) as ws:
+                        log.info("Session WebSocket connected (session %s)", session_id)
+                        while True:
+                            msg = await ws.receive_bytes()
+                            if msg[0:1] == b'\x01':
+                                try:
+                                    event = json_mod.loads(msg[1:])
+                                    comment = event.get("comment", {})
+                                    if comment.get("author") != authors.CLAUDE:
+                                        self._session_comment_queue.put_nowait({
+                                            "comment_id": comment.get("id", ""),
+                                            "author": comment.get("author", "unknown"),
+                                            "quote": comment.get("quote", ""),
+                                            "body": comment.get("body", ""),
+                                        })
+                                except Exception:
+                                    log.warning("Failed to parse session comment event", exc_info=True)
+                except Exception:
+                    log.debug("Session WebSocket disconnected, reconnecting in 5s")
+                    await asyncio.sleep(5)
+
+        self._session_ws_task = asyncio.create_task(_session_ws_loop())
+        self._session_consumer_task = asyncio.create_task(
+            _session_comment_consumer(
+                self._session_comment_queue,
+                lambda: self._session,
+                self.session_ready,
+                self.session_timeout,
+            )
+        )
+
     async def close_all(self) -> None:
+        if self._session_ws_task is not None:
+            self._session_ws_task.cancel()
+            try:
+                await self._session_ws_task
+            except asyncio.CancelledError:
+                pass
+        if self._session_consumer_task is not None:
+            self._session_consumer_task.cancel()
+            try:
+                await self._session_consumer_task
+            except asyncio.CancelledError:
+                pass
         if hasattr(self, "_poll_task"):
             self._poll_task.cancel()
             try:
@@ -769,7 +871,38 @@ def _git_commit_flush(docs_dir: Path, md_path: Path, room: str) -> str:
 # --- FastMCP setup ---
 
 
-@asynccontextmanager
+def _get_grandparent_pid() -> int | None:
+    """Get the grandparent PID (claude) from /proc.
+
+    Process tree: claude → uv → python (this MCP server).
+    """
+    ppid = os.getppid()
+    try:
+        return int(
+            Path(f"/proc/{ppid}/status").read_text()
+            .split("PPid:\t")[1].split("\n")[0]
+        )
+    except (FileNotFoundError, IndexError, ValueError):
+        return None
+
+
+def _get_cc_session_id() -> str | None:
+    """Read the CC session ID from ~/.claude/sessions/{PID}.json.
+
+    The PID is the grandparent (claude process). Returns None if the
+    session file doesn't exist or can't be parsed.
+    """
+    grandparent = _get_grandparent_pid()
+    if grandparent is None:
+        return None
+    session_file = Path.home() / ".claude" / "sessions" / f"{grandparent}.json"
+    try:
+        data = json_mod.loads(session_file.read_text())
+        return data.get("sessionId")
+    except (FileNotFoundError, json_mod.JSONDecodeError, KeyError):
+        return None
+
+
 async def _parent_watchdog(interval: float = 30.0) -> None:
     """Exit if the grandparent process (claude) dies.
 
@@ -781,13 +914,8 @@ async def _parent_watchdog(interval: float = 30.0) -> None:
     Uses grandparent (not parent) because uv is an intermediary wrapper
     that can outlive CC.
     """
-    ppid = os.getppid()  # uv
-    try:
-        grandparent = int(
-            Path(f"/proc/{ppid}/status").read_text()
-            .split("PPid:\t")[1].split("\n")[0]
-        )
-    except (FileNotFoundError, IndexError, ValueError):
+    grandparent = _get_grandparent_pid()
+    if grandparent is None:
         log.warning("Parent watchdog: can't determine grandparent PID, disabled")
         return
 
@@ -803,6 +931,7 @@ async def _parent_watchdog(interval: float = 30.0) -> None:
             pass  # process exists but we can't signal it — still alive
 
 
+@asynccontextmanager
 async def lifespan(app: FastMCP) -> AsyncIterator[AppState]:
     configure_logging()
     call_log = configure_call_logging()
@@ -812,6 +941,12 @@ async def lifespan(app: FastMCP) -> AsyncIterator[AppState]:
     async with httpx.AsyncClient() as client:
         state = AppState(client=client, server_url=server_url)
         await state.start_room_poller()
+        session_id = _get_cc_session_id()
+        if session_id:
+            await state.start_session_ws(session_id)
+            log.info("Session-direct WebSocket started (session %s)", session_id)
+        else:
+            log.info("No CC session ID found — session-direct comments disabled")
         watchdog = asyncio.create_task(_parent_watchdog())
         try:
             yield state

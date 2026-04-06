@@ -73,7 +73,9 @@ class MockChannel:
 
 
 @asynccontextmanager
-async def connect_peer(port: int, room: str) -> AsyncIterator[Text]:
+async def connect_peer(
+    port: int, room: str, *, session_id: str | None = None,
+) -> AsyncIterator[Text]:
     """Connect a Yjs peer to the server using the standalone sync protocol.
 
     Uses deterministic sync detection (SYNC_STEP2 event) instead of
@@ -85,8 +87,11 @@ async def connect_peer(port: int, room: str) -> AsyncIterator[Text]:
     synced = Event()
 
     async def _task() -> None:
+        url = f"http://127.0.0.1:{port}/_ws/{room}"
+        if session_id:
+            url += f"?session_id={session_id}"
         async with httpx.AsyncClient() as client:
-            async with aconnect_ws(f"http://127.0.0.1:{port}/_ws/{room}", client) as ws:
+            async with aconnect_ws(url, client) as ws:
                 channel = WebSocketChannel(ws)
                 await _sync_loop(doc, channel, synced, keepalive=None)
 

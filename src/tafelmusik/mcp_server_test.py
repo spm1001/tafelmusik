@@ -1261,3 +1261,51 @@ async def test_add_comment_by_claude_no_self_notification(server):
 
         # No notification — Claude's own comments are filtered by _handle_comment_event
         assert len(mock_session.messages) == 0
+
+
+# --- Session-direct comment tests (tfm-fetuvi) ---
+
+
+async def test_session_comment_arrives_in_queue(server):
+    """POST /api/sessions/{id}/comments delivers to MCP's session comment queue."""
+    sid = "test-session-fetuvi"
+    async with make_state(server) as state:
+        await state.start_session_ws(sid)
+        # Give the WebSocket time to connect and register
+        await asyncio.sleep(1.0)
+
+        http_url = f"http://127.0.0.1:{server}"
+        async with httpx.AsyncClient() as post_client:
+            r = await post_client.post(
+                f"{http_url}/api/sessions/{sid}/comments",
+                json={"author": "sameer", "body": "look at this output", "quote": "some text"},
+            )
+            assert r.status_code == 201
+
+        # Comment should arrive in the session comment queue
+        event = await asyncio.wait_for(
+            state._session_comment_queue.get(), timeout=3.0,
+        )
+        assert event["author"] == "sameer"
+        assert event["body"] == "look at this output"
+        assert event["quote"] == "some text"
+
+
+async def test_session_comment_filters_claude_author(server):
+    """Claude's own session comments are filtered, not queued."""
+    sid = "test-session-filter"
+    async with make_state(server) as state:
+        await state.start_session_ws(sid)
+        await asyncio.sleep(1.0)
+
+        http_url = f"http://127.0.0.1:{server}"
+        async with httpx.AsyncClient() as post_client:
+            r = await post_client.post(
+                f"{http_url}/api/sessions/{sid}/comments",
+                json={"author": authors.CLAUDE, "body": "my own comment"},
+            )
+            assert r.status_code == 201
+
+        # Give time for any event to arrive
+        await asyncio.sleep(1.0)
+        assert state._session_comment_queue.empty()

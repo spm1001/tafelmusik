@@ -1,13 +1,15 @@
 """Tests for ASGI server."""
 
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
 import pytest
 import uvicorn
+from httpx_ws import aconnect_ws
 
-from tafelmusik.asgi_server import create_app
+from tafelmusik.asgi_server import COMMENT_MSG_TYPE, create_app
 from tafelmusik.conftest import connect_peer, get_free_port
 
 
@@ -222,3 +224,106 @@ async def test_api_rooms_does_not_leak_fds(server):
     # unmistakable. Before the fix, this leaked exactly 50.
     leaked = count_fds() - baseline
     assert leaked < 10, f"Leaked {leaked} FDs after 50 /api/rooms calls"
+
+
+async def test_session_registry_lifecycle(managed_server):
+    """Session ID is tracked in registry on connect, removed on disconnect."""
+    port, manager = managed_server
+    sid = "test-session-abc123"
+
+    async with connect_peer(port, "session-test", session_id=sid):
+        assert sid in manager.session_registry
+    # After disconnect
+    await asyncio.sleep(0.5)
+    assert sid not in manager.session_registry
+
+
+async def test_session_registry_no_session_id(managed_server):
+    """Connections without session_id don't pollute the registry."""
+    port, manager = managed_server
+
+    async with connect_peer(port, "no-session-test"):
+        assert len(manager.session_registry) == 0
+
+
+async def test_session_comment_delivered(managed_server):
+    """POST /api/sessions/{id}/comments stores and delivers to the session."""
+    port, manager = managed_server
+    sid = "comment-target-session"
+
+    async with connect_peer(port, "session-room", session_id=sid):
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"http://127.0.0.1:{port}/api/sessions/{sid}/comments",
+                json={"author": "sameer", "body": "hey Claude, look at this"},
+            )
+        assert r.status_code == 201
+        data = r.json()
+        assert data["target"] == f"session:{sid}"
+        assert data["body"] == "hey Claude, look at this"
+        assert data["author"] == "sameer"
+
+
+async def test_session_comment_404_when_not_connected(managed_server):
+    """POST to a non-existent session returns 404."""
+    port, _ = managed_server
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"http://127.0.0.1:{port}/api/sessions/no-such-session/comments",
+            json={"author": "sameer", "body": "hello?"},
+        )
+    assert r.status_code == 404
+    assert "not connected" in r.json()["error"]
+
+
+async def test_session_comment_not_broadcast_to_room(managed_server):
+    """Session-direct comments don't leak to room peers."""
+    port, manager = managed_server
+    sid = "isolated-session"
+
+    # Connect session peer and a plain room peer to the same room
+    async with connect_peer(port, "shared-room", session_id=sid):
+        async with connect_peer(port, "shared-room") as room_text:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    f"http://127.0.0.1:{port}/api/sessions/{sid}/comments",
+                    json={"author": "sameer", "body": "session-only msg"},
+                )
+            assert r.status_code == 201
+            # Room peer's CRDT text should not contain the comment
+            # (session comments go via 0x01 to the WebSocket, not via CRDT)
+            await asyncio.sleep(0.3)
+            assert "session-only msg" not in str(room_text)
+
+
+async def test_dedicated_session_websocket(managed_server):
+    """Dedicated session WebSocket receives 0x01 comment events."""
+    port, manager = managed_server
+    sid = "dedicated-ws-test"
+
+    async with httpx.AsyncClient() as client:
+        async with aconnect_ws(
+            f"http://127.0.0.1:{port}/_ws/_session/{sid}", client,
+        ) as ws:
+            # Wait for registration
+            await asyncio.sleep(0.3)
+            assert sid in manager.session_registry
+
+            # POST a session comment
+            r = await client.post(
+                f"http://127.0.0.1:{port}/api/sessions/{sid}/comments",
+                json={"author": "sameer", "body": "direct delivery"},
+            )
+            assert r.status_code == 201
+
+            # Read the 0x01 event from the WebSocket
+            msg = await asyncio.wait_for(ws.receive_bytes(), timeout=2.0)
+            assert msg[0:1] == COMMENT_MSG_TYPE
+            event = json.loads(msg[1:])
+            assert event["type"] == "comment_created"
+            assert event["comment"]["body"] == "direct delivery"
+            assert event["comment"]["target"] == f"session:{sid}"
+
+    # After disconnect
+    await asyncio.sleep(0.3)
+    assert sid not in manager.session_registry
