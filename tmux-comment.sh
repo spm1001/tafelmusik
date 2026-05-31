@@ -1,6 +1,6 @@
 #!/bin/bash
 # Tmux popup for anchored comments.
-# Bind in .tmux.conf:   bind C-n run-shell "~/Repos/batterie/tafelmusik/tmux-comment.sh"
+# Bind in .tmux.conf:   bind C-n run-shell "~/.local/opt/tafelmusik/tmux-comment.sh"
 #
 # Flow: select text in tmux → prefix+Ctrl+N → popup → type comment → enter → stored.
 #
@@ -8,7 +8,10 @@
 # to comment.py via --session-id. The popup runs in a new pane where
 # the pane-aware Claude PID lookup would find nothing.
 
-SCRIPT=~/Repos/batterie/tafelmusik/comment.py
+# Self-locating: comment.py is this script's sibling. readlink -f resolves the
+# ~/.local/opt/tafelmusik indirection symlink to the real repo, so this works
+# no matter where the repo lives (infra iw-vakuwa — no hardcoded worktree path).
+SCRIPT="$(dirname "$(readlink -f "$0")")/comment.py"
 
 # Resolve session ID from the active pane's Claude process
 SESSION_ID=""
