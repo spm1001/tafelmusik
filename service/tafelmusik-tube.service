@@ -1,0 +1,21 @@
+[Unit]
+Description=Tafelmusik collaborative editing server
+After=network.target
+
+[Service]
+Type=simple
+# ~/.local/opt/tafelmusik on tube is a REAL COPY of the deployment (code +
+# data/ live state), rsync'd from hezza at the 2026-07-06 cutover (iw-hegesa)
+# — NOT a symlink into a working tree (the weaning principle, iw-numeho).
+# tafelmusik is still __file__-rooted for data/ + public/, so the copy is
+# self-contained; proper packaging is tracked as tfm-luselo.
+WorkingDirectory=/home/modha/.local/opt/tafelmusik
+# Use venv python directly — avoids uv dep resolution on every restart.
+# Run `uv sync` here after changing dependencies, before restarting.
+# ws-ping-interval/timeout: websockets 16 defaults to 20s/20s which causes
+# browser disconnects every ~30-40s. 60s gives breathing room.
+ExecStart=/home/modha/.local/opt/tafelmusik/.venv/bin/python -m uvicorn tafelmusik.asgi_server:app --host 0.0.0.0 --port 3456 --ws-ping-interval 60 --ws-ping-timeout 60
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
